@@ -24,6 +24,13 @@ def init_db():
     ''')
     
     conn.commit()
+
+    cursor.execute("PRAGMA table_info(inventory)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "vision_device_type" not in columns:
+        cursor.execute("ALTER TABLE inventory ADD COLUMN vision_device_type TEXT")
+        conn.commit()
+
     conn.close()
     print("Database initialized.")
 

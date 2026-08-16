@@ -12,6 +12,7 @@ document.addEventListener('DOMContentLoaded', () => {
         serial: document.getElementById('modal-serial'),
         imei: document.getElementById('modal-imei'),
         date: document.getElementById('modal-date'),
+        visionType: document.getElementById('modal-vision-type'),
         remarks: document.getElementById('modal-remarks'),
         condition: document.getElementById('modal-condition'),
         partsList: document.getElementById('modal-parts-list'),
@@ -53,7 +54,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     </td>
                     <td class="px-6 py-4 whitespace-nowrap">
                         <div class="text-sm font-medium text-gray-900">${item.model || 'Unknown'}</div>
-                        <div class="text-sm text-gray-500">${item.color || ''} ${item.capacity || ''}</div>
+                        <div class="text-sm text-gray-500">${item.color || ''} ${item.capacity || ''} ${item.vision_device_type ? '· ' + item.vision_device_type : ''}</div>
                     </td>
                     <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                         S/N: ${item.serial_number || 'N/A'}<br>
@@ -90,6 +91,7 @@ document.addEventListener('DOMContentLoaded', () => {
         elements.serial.innerText = item.serial_number || '-';
         elements.imei.innerText = item.imei || '-';
         elements.date.innerText = item.date_received || '-';
+        elements.visionType.innerText = item.vision_device_type || '-';
         elements.remarks.innerText = item.remarks || 'No remarks provided.';
         elements.condition.innerText = item.damage_condition || 'Unknown';
 

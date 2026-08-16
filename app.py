@@ -9,6 +9,7 @@ from flask_cors import CORS
 from PIL import Image, ImageEnhance, ImageFilter
 from pyzbar.pyzbar import decode as pyzbar_decode
 from database import init_db
+from vision import analyze_photos
 
 app = Flask(__name__, static_folder='static')
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max upload
@@ -26,13 +27,8 @@ def get_db_connection():
     return conn
 
 def analyze_damage_vision_api(front_image_path, back_image_path):
-    """
-    Placeholder for YOLO/Computer Vision API (like Roboflow).
-    In a real app, this would send images to the API and parse the response.
-    For now, we return a mock condition based on random chance or just "Cracked Screen".
-    """
-    # Mock analysis
-    return "Cracked Screen"
+    """Run the device-vision classifiers on saved front/back photos."""
+    return analyze_photos(front_image_path, back_image_path)
 
 def determine_parts_needed(damage_condition, remarks):
     parts = []
@@ -192,19 +188,15 @@ def get_inventory():
 
 @app.route('/api/scan', methods=['POST'])
 def scan_photos():
-    """
-    New endpoint: receives front + back photos, processes QR on backend,
-    returns parsed device info.
-    """
-    data = request.json
-    back_image_b64 = data.get('back_image', '')
-    
-    if not back_image_b64:
-        return jsonify({'success': False, 'message': 'Back image is required'}), 400
-    
-    # Scan QR from back image on the server
-    qr_text = scan_qr_from_image(back_image_b64)
-    
+    """Scan a dedicated close-up QR label photo (not the full back shot)."""
+    data = request.json or {}
+    qr_image_b64 = data.get('qr_image') or data.get('back_image') or ''
+
+    if not qr_image_b64:
+        return jsonify({'success': False, 'message': 'QR label image is required'}), 400
+
+    qr_text = scan_qr_from_image(qr_image_b64)
+
     if qr_text:
         parsed = parse_qr_text(qr_text)
         return jsonify({
@@ -213,12 +205,12 @@ def scan_photos():
             'qr_raw': qr_text,
             'parsed': parsed
         })
-    else:
-        return jsonify({
-            'success': True,
-            'qr_found': False,
-            'message': 'No QR code detected in the back image. Try a clearer photo.'
-        })
+
+    return jsonify({
+        'success': True,
+        'qr_found': False,
+        'message': 'No QR code detected. Zoom in closer on the label and try again.'
+    })
 
 @app.route('/api/inventory', methods=['POST'])
 def add_inventory():
@@ -240,7 +232,12 @@ def add_inventory():
     front_image_url = save_base64_image(front_image_b64, "front")
     back_image_url = save_base64_image(back_image_b64, "back")
     
-    damage_condition = analyze_damage_vision_api(front_image_url, back_image_url)
+    vision = analyze_damage_vision_api(front_image_url, back_image_url)
+    damage_condition = vision.get("damage_condition") or "Vision unavailable"
+    vision_device_type = vision.get("device_type") or "unknown"
+    if not model and vision_device_type in {"phone", "tablet"}:
+        model = vision_device_type.title()
+    
     parts_needed = determine_parts_needed(damage_condition, remarks)
     
     conn = get_db_connection()
@@ -249,12 +246,14 @@ def add_inventory():
         INSERT INTO inventory (
             date_received, model, color, capacity, serial_number, 
             ios_version, imei, battery_health, remarks, 
-            front_image_url, back_image_url, damage_condition, parts_needed
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            front_image_url, back_image_url, damage_condition, parts_needed,
+            vision_device_type
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         date_received, model, color, capacity, serial_number,
         ios_version, imei, battery_health, remarks,
-        front_image_url, back_image_url, damage_condition, json.dumps(parts_needed)
+        front_image_url, back_image_url, damage_condition, json.dumps(parts_needed),
+        vision_device_type
     ))
     
     conn.commit()
