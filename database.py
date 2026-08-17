@@ -30,6 +30,12 @@ def init_db():
     if "vision_device_type" not in columns:
         cursor.execute("ALTER TABLE inventory ADD COLUMN vision_device_type TEXT")
         conn.commit()
+    if "lock_status" not in columns:
+        cursor.execute("ALTER TABLE inventory ADD COLUMN lock_status TEXT")
+        conn.commit()
+    if "inventory_number" not in columns:
+        cursor.execute("ALTER TABLE inventory ADD COLUMN inventory_number TEXT")
+        conn.commit()
 
     conn.close()
     print("Database initialized.")

@@ -1,0 +1,45 @@
+{
+  "name": "Repair Inventory",
+  "short_name": "Inventory",
+  "description": "Phone repair intake scanner and inventory dashboard",
+  "start_url": "/scanner.html",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#1e40af",
+  "theme_color": "#1e40af",
+  "icons": [
+    {
+      "src": "/static/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/static/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/static/icons/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Scanner",
+      "short_name": "Scanner",
+      "url": "/scanner.html",
+      "icons": [{ "src": "/static/icons/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Dashboard",
+      "short_name": "Dashboard",
+      "url": "/",
+      "icons": [{ "src": "/static/icons/icon-192.png", "sizes": "192x192" }]
+    }
+  ]
+}

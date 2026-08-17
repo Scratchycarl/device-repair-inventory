@@ -4,6 +4,15 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Edge Scanner</title>
+    <meta name="application-name" content="Edge Scanner">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Scanner">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="theme-color" content="#2563eb">
+    <link rel="manifest" href="/static/manifest.webmanifest">
+    <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
+    <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png">
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-gray-100 min-h-screen text-gray-800 font-sans p-4">
@@ -14,12 +23,10 @@
         </div>
         
         <div class="p-4">
-            <!-- Step Indicator -->
             <div id="step-indicator" class="text-center font-bold text-blue-700 mb-4 text-lg">
                 Step 1: Snap Front Photo
             </div>
 
-            <!-- Capture Buttons -->
             <div id="capture-section" class="mb-6 space-y-3">
                 <label id="lbl-front" class="block w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 px-4 rounded-lg cursor-pointer text-center shadow">
                     Snap Front Photo
@@ -36,71 +43,141 @@
                     <input type="file" id="input-upload-back" accept="image/*" class="hidden">
                 </label>
 
-                <label id="lbl-qr" class="hidden block w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 px-4 rounded-lg cursor-pointer text-center shadow">
-                    Snap QR Label (zoom in close)
-                    <input type="file" id="input-qr" accept="image/*" capture="environment" class="hidden">
-                </label>
-
-                <label id="lbl-upload-qr" class="hidden block w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 px-4 rounded-lg cursor-pointer text-center shadow text-sm">
-                    Or Upload QR Label from Gallery
-                    <input type="file" id="input-upload-qr" accept="image/*" class="hidden">
-                </label>
-
                 <button id="btn-retake" class="hidden w-full bg-gray-500 hover:bg-gray-600 text-white font-bold py-3 px-4 rounded-lg">
                     Retake Photos
                 </button>
             </div>
 
-            <!-- Previews -->
             <div class="flex gap-2 mb-6">
-                <div id="preview-front" class="flex-1 h-28 bg-gray-200 rounded border border-gray-300 flex items-center justify-center overflow-hidden relative shadow-inner">
+                <div id="preview-front" class="flex-1 h-36 bg-gray-200 rounded border border-gray-300 flex items-center justify-center overflow-hidden relative shadow-inner">
                     <span class="text-xs text-gray-500">Front</span>
                 </div>
-                <div id="preview-back" class="flex-1 h-28 bg-gray-200 rounded border border-gray-300 flex items-center justify-center overflow-hidden relative shadow-inner">
+                <div id="preview-back" class="flex-1 h-36 bg-gray-200 rounded border border-gray-300 flex items-center justify-center overflow-hidden relative shadow-inner">
                     <span class="text-xs text-gray-500">Back</span>
                 </div>
-                <div id="preview-qr" class="flex-1 h-28 bg-gray-200 rounded border border-gray-300 flex items-center justify-center overflow-hidden relative shadow-inner">
-                    <span class="text-xs text-gray-500">QR</span>
+                <div id="preview-qr-wrap" class="hidden flex-1 h-36 bg-gray-200 rounded border border-gray-300 flex items-center justify-center overflow-hidden relative shadow-inner">
+                    <div id="preview-qr" class="absolute inset-0 flex items-center justify-center">
+                        <span class="text-xs text-gray-500">QR</span>
+                    </div>
                 </div>
             </div>
 
-            <!-- Processing Spinner -->
             <div id="processing" class="hidden text-center py-8">
                 <div class="inline-block animate-spin rounded-full h-12 w-12 border-4 border-blue-600 border-t-transparent mb-4"></div>
-                <p class="text-blue-700 font-bold text-lg">Reading QR label...</p>
-                <p class="text-gray-500 text-sm mt-1">Looking for the QR code in your close-up shot</p>
+                <p class="text-blue-700 font-bold text-lg" id="processing-title">Scanning QR code...</p>
+                <p class="text-gray-500 text-sm mt-1" id="processing-sub">Looking for the label on the back photo</p>
             </div>
 
-            <!-- Results Section -->
             <div id="results-section" class="hidden">
                 <div id="parsed-data" class="mb-4 p-4 bg-green-50 border border-green-200 rounded-lg text-sm">
-                    <h3 class="font-bold text-green-800 mb-3 border-b border-green-200 pb-2 flex items-center gap-2">
+                    <h3 class="font-bold text-green-800 mb-3 border-b border-green-200 pb-2" id="parsed-title">
                         Device Identified
                     </h3>
+                    <p class="text-xs text-green-700 mb-3">Edit any field if the scan or text read is off.</p>
                     <div class="grid grid-cols-2 gap-y-3 gap-x-2 text-xs">
-                        <div><span class="font-semibold text-gray-500 block">Model</span> <span id="val-model" class="font-medium text-gray-900 text-sm"></span></div>
-                        <div><span class="font-semibold text-gray-500 block">Color</span> <span id="val-color" class="font-medium text-gray-900 text-sm"></span></div>
-                        <div><span class="font-semibold text-gray-500 block">Capacity</span> <span id="val-capacity" class="font-medium text-gray-900 text-sm"></span></div>
-                        <div><span class="font-semibold text-gray-500 block">Serial</span> <span id="val-serial" class="font-medium text-gray-900 text-sm"></span></div>
-                        <div class="col-span-2"><span class="font-semibold text-gray-500 block">IMEI</span> <span id="val-imei" class="font-medium text-gray-900 text-sm"></span></div>
-                        <div><span class="font-semibold text-gray-500 block">iOS</span> <span id="val-ios" class="font-medium text-gray-900 text-sm"></span></div>
-                        <div><span class="font-semibold text-gray-500 block">Battery</span> <span id="val-battery" class="font-medium text-gray-900 text-sm"></span></div>
+                        <div>
+                            <span class="font-semibold text-gray-500 block">Model</span>
+                            <input id="val-model" class="w-full border border-green-200 rounded px-2 py-1 text-sm text-gray-900 bg-white">
+                        </div>
+                        <div>
+                            <span class="font-semibold text-gray-500 block">Color</span>
+                            <input id="val-color" class="w-full border border-green-200 rounded px-2 py-1 text-sm text-gray-900 bg-white">
+                        </div>
+                        <div>
+                            <span class="font-semibold text-gray-500 block">Capacity</span>
+                            <input id="val-capacity" class="w-full border border-green-200 rounded px-2 py-1 text-sm text-gray-900 bg-white">
+                        </div>
+                        <div>
+                            <span class="font-semibold text-gray-500 block">Serial</span>
+                            <input id="val-serial" class="w-full border border-green-200 rounded px-2 py-1 text-sm text-gray-900 bg-white">
+                        </div>
+                        <div class="col-span-2">
+                            <span class="font-semibold text-gray-500 block">IMEI</span>
+                            <input id="val-imei" class="w-full border border-green-200 rounded px-2 py-1 text-sm text-gray-900 bg-white">
+                        </div>
+                        <div>
+                            <span class="font-semibold text-gray-500 block">iOS</span>
+                            <input id="val-ios" class="w-full border border-green-200 rounded px-2 py-1 text-sm text-gray-900 bg-white">
+                        </div>
+                        <div>
+                            <span class="font-semibold text-gray-500 block">Battery</span>
+                            <input id="val-battery" class="w-full border border-green-200 rounded px-2 py-1 text-sm text-gray-900 bg-white">
+                        </div>
+                        <div>
+                            <span class="font-semibold text-gray-500 block">Inv #</span>
+                            <input id="val-inv" class="w-full border border-green-200 rounded px-2 py-1 text-sm text-gray-900 bg-white">
+                        </div>
+                        <div class="col-span-2">
+                            <span class="font-semibold text-gray-500 block">Date</span>
+                            <input id="val-date" class="w-full border border-green-200 rounded px-2 py-1 text-sm text-gray-900 bg-white">
+                        </div>
                     </div>
                 </div>
 
-                <!-- Error state for QR not found -->
-                <div id="qr-error" class="hidden mb-4 p-4 bg-red-50 border border-red-200 rounded-lg text-sm">
-                    <h3 class="font-bold text-red-800 mb-2">QR Code Not Found</h3>
-                    <p class="text-red-700 text-sm" id="qr-error-msg">Could not detect a QR code. Zoom in closer on the label and try again.</p>
+                <div class="mb-4">
+                    <label class="block text-sm font-bold text-gray-700 mb-2">Lock Status</label>
+                    <select id="val-lock-status" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-900 bg-white focus:ring-blue-500 focus:border-blue-500">
+                        <option value="">Select…</option>
+                        <option value="Unlocked">Unlocked</option>
+                        <option value="Locked (FMI ON)">Locked (FMI ON)</option>
+                        <option value="Signal Bypassed">Signal Bypassed</option>
+                        <option value="Bypassed">Bypassed</option>
+                        <option value="SN Unlocked">SN Unlocked</option>
+                    </select>
+                    <p class="text-xs text-gray-500 mt-1">OCR fills this from U / L / Sig-B / B / SN-U. Locked or Bypassed devices are excluded from the parts list.</p>
                 </div>
 
-                <!-- Custom Remarks -->
+                <div id="qr-error" class="hidden mb-4 p-4 bg-red-50 border border-red-200 rounded-lg text-sm">
+                    <h3 class="font-bold text-red-800 mb-2">QR Code Not Found</h3>
+                    <p class="text-red-700 text-sm mb-3" id="qr-error-msg">Could not detect a QR code on the back photo.</p>
+
+                    <label class="flex items-start gap-3 cursor-pointer select-none mb-3">
+                        <input type="checkbox" id="chk-ocr-label" class="mt-1 h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500">
+                        <span class="text-sm text-gray-800">
+                            Extract text from the label instead
+                            <span class="block text-xs text-gray-500 mt-0.5">For older labels where the QR is too small. Zoom in on the printed text.</span>
+                        </span>
+                    </label>
+
+                    <div id="ocr-label-actions" class="hidden space-y-2 mb-4">
+                        <button type="button" id="btn-ocr-back" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-lg shadow text-sm">
+                            Read text from back photo
+                        </button>
+                        <label class="block w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-lg cursor-pointer text-center shadow text-sm">
+                            Snap closer photo of the label
+                            <input type="file" id="input-ocr" accept="image/*" capture="environment" class="hidden">
+                        </label>
+                        <label class="block w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 px-4 rounded-lg cursor-pointer text-center shadow text-sm">
+                            Or upload label photo from gallery
+                            <input type="file" id="input-upload-ocr" accept="image/*" class="hidden">
+                        </label>
+                    </div>
+
+                    <label class="flex items-start gap-3 cursor-pointer select-none mb-3">
+                        <input type="checkbox" id="chk-qr-closeup" class="mt-1 h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500">
+                        <span class="text-sm text-gray-800">
+                            Take a zoomed-in photo of the QR label
+                            <span class="block text-xs text-gray-500 mt-0.5">Optional — only if the back photo didn’t catch the code</span>
+                        </span>
+                    </label>
+
+                    <div id="qr-closeup-actions" class="hidden space-y-2">
+                        <label id="lbl-qr" class="block w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-lg cursor-pointer text-center shadow text-sm">
+                            Snap Zoomed QR Photo
+                            <input type="file" id="input-qr" accept="image/*" capture="environment" class="hidden">
+                        </label>
+                        <label id="lbl-upload-qr" class="block w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 px-4 rounded-lg cursor-pointer text-center shadow text-sm">
+                            Or Upload QR Label from Gallery
+                            <input type="file" id="input-upload-qr" accept="image/*" class="hidden">
+                        </label>
+                    </div>
+                </div>
+
                 <div class="mb-4">
                     <label class="block text-sm font-bold text-gray-700 mb-2">Custom Remarks</label>
                     <textarea id="custom-remarks" rows="3" class="w-full border border-gray-300 rounded-lg p-3 text-sm focus:ring-blue-500 focus:border-blue-500 shadow-sm" placeholder="e.g. Won't turn on, water damage..."></textarea>
                 </div>
 
-                <!-- Submit Button -->
                 <button id="btn-submit" class="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-4 px-4 rounded-xl shadow-lg text-lg">
                     Submit to Inventory
                 </button>
@@ -108,6 +185,6 @@
         </div>
     </div>
 
-    <script src="/static/js/scanner.js?v=11"></script>
+    <script src="/static/js/scanner.js?v=20"></script>
 </body>
 </html>

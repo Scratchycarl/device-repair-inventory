@@ -1,6 +1,6 @@
 # Device Repair Inventory
 
-Flask + SQLite app for a phone repair shop. Intake devices from a phone browser with three photos (front, back, zoomed QR label), then review inventory on a desktop dashboard.
+Flask + SQLite app for a phone repair shop. Intake devices from a phone browser with front and back photos (optional zoomed QR if needed), then review inventory on a desktop dashboard.
 
 Exterior damage and phone-vs-tablet classification come from the sibling [device-vision](https://github.com/Scratchycarl/device-vision) models (local import or HTTP to the vision API).
 
@@ -23,8 +23,9 @@ On a phone, use the computer's LAN IP (or an HTTPS tunnel). Camera capture often
 ## Scanner flow
 
 1. Front photo (screen)
-2. Back photo (full device — used by vision)
-3. Zoomed QR label photo (pyzbar)
+2. Back photo (full device — used for vision + QR)
+
+If QR isn’t found on the back photo, you can optionally check **Take a zoomed-in photo of the QR label** and shoot a close-up.
 
 QR labels are comma-separated:
 

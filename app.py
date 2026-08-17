@@ -10,6 +10,8 @@ from PIL import Image, ImageEnhance, ImageFilter
 from pyzbar.pyzbar import decode as pyzbar_decode
 from database import init_db
 from vision import analyze_photos
+from repair_parts import determine_parts_needed as map_parts_needed
+from ocr_label import extract_label_fields
 
 app = Flask(__name__, static_folder='static')
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max upload
@@ -30,23 +32,35 @@ def analyze_damage_vision_api(front_image_path, back_image_path):
     """Run the device-vision classifiers on saved front/back photos."""
     return analyze_photos(front_image_path, back_image_path)
 
-def determine_parts_needed(damage_condition, remarks):
-    parts = []
-    condition = damage_condition.lower()
-    
-    if "cracked screen" in condition:
-        parts.append("OLED Assembly")
-    if "back glass" in condition:
-        parts.append("Back Housing")
-    
-    # Also check remarks
-    remarks_lower = (remarks or "").lower()
-    if "battery" in remarks_lower:
-        parts.append("Replacement Battery")
-    if "camera" in remarks_lower:
-        parts.append("Camera Module")
-        
-    return parts
+def parse_battery_percent(battery_health):
+    """Extract numeric battery % from values like '87%' or '87'."""
+    if battery_health is None:
+        return None
+    text = str(battery_health).strip()
+    if not text:
+        return None
+    digits = []
+    for ch in text:
+        if ch.isdigit():
+            digits.append(ch)
+        elif digits:
+            break
+    if not digits:
+        return None
+    try:
+        return int("".join(digits))
+    except ValueError:
+        return None
+
+
+def determine_parts_needed(damage_condition, remarks, battery_health=None, model=None):
+    return map_parts_needed(
+        damage_condition,
+        remarks,
+        battery_health=battery_health,
+        model=model,
+        parse_battery_percent=parse_battery_percent,
+    )
 
 def save_base64_image(base64_string, prefix):
     if not base64_string:
@@ -209,8 +223,21 @@ def scan_photos():
     return jsonify({
         'success': True,
         'qr_found': False,
-        'message': 'No QR code detected. Zoom in closer on the label and try again.'
+        'message': 'No QR code detected on the back photo. You can optionally take a zoomed-in label shot or extract the printed text.'
     })
+
+
+@app.route('/api/ocr', methods=['POST'])
+def ocr_label():
+    """Read printed label text when the QR code is too small."""
+    data = request.json or {}
+    image_b64 = data.get('label_image') or data.get('qr_image') or data.get('back_image') or ''
+    if not image_b64:
+        return jsonify({'success': False, 'message': 'Label image is required'}), 400
+
+    result = extract_label_fields(image_b64)
+    status = 200 if result.get('success') else 400
+    return jsonify(result), status
 
 @app.route('/api/inventory', methods=['POST'])
 def add_inventory():
@@ -225,6 +252,8 @@ def add_inventory():
     battery_health = data.get('battery_health', '')
     date_received = data.get('date_received', '')
     remarks = data.get('remarks', '')
+    lock_status = (data.get('lock_status') or '').strip()
+    inventory_number = (data.get('inventory_number') or '').strip()
     
     front_image_b64 = data.get('front_image', '')
     back_image_b64 = data.get('back_image', '')
@@ -238,7 +267,9 @@ def add_inventory():
     if not model and vision_device_type in {"phone", "tablet"}:
         model = vision_device_type.title()
     
-    parts_needed = determine_parts_needed(damage_condition, remarks)
+    parts_needed = determine_parts_needed(
+        damage_condition, remarks, battery_health, model=model
+    )
     
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -247,13 +278,13 @@ def add_inventory():
             date_received, model, color, capacity, serial_number, 
             ios_version, imei, battery_health, remarks, 
             front_image_url, back_image_url, damage_condition, parts_needed,
-            vision_device_type
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            vision_device_type, lock_status, inventory_number
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         date_received, model, color, capacity, serial_number,
         ios_version, imei, battery_health, remarks,
         front_image_url, back_image_url, damage_condition, json.dumps(parts_needed),
-        vision_device_type
+        vision_device_type, lock_status, inventory_number
     ))
     
     conn.commit()
@@ -265,6 +296,90 @@ def add_inventory():
         "id": new_id, 
         "message": "Device added to inventory"
     }), 201
+
+
+@app.route('/api/inventory/<int:item_id>', methods=['PATCH'])
+def update_inventory(item_id):
+    """Update editable fields (parts list, remarks, condition)."""
+    data = request.json or {}
+    conn = get_db_connection()
+    row = conn.execute('SELECT id FROM inventory WHERE id = ?', (item_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Item not found'}), 404
+
+    fields = []
+    values = []
+
+    if 'parts_needed' in data:
+        parts = data['parts_needed']
+        if not isinstance(parts, list):
+            conn.close()
+            return jsonify({'success': False, 'message': 'parts_needed must be a list'}), 400
+        cleaned = [str(p).strip() for p in parts if str(p).strip()]
+        fields.append('parts_needed = ?')
+        values.append(json.dumps(cleaned))
+
+    if 'remarks' in data:
+        fields.append('remarks = ?')
+        values.append(data.get('remarks') or '')
+
+    if 'damage_condition' in data:
+        fields.append('damage_condition = ?')
+        values.append(data.get('damage_condition') or '')
+
+    if 'lock_status' in data:
+        fields.append('lock_status = ?')
+        values.append((data.get('lock_status') or '').strip())
+
+    if 'inventory_number' in data:
+        fields.append('inventory_number = ?')
+        values.append((data.get('inventory_number') or '').strip())
+
+    if not fields:
+        conn.close()
+        return jsonify({'success': False, 'message': 'No updatable fields provided'}), 400
+
+    values.append(item_id)
+    conn.execute(f"UPDATE inventory SET {', '.join(fields)} WHERE id = ?", values)
+    conn.commit()
+    updated = conn.execute('SELECT * FROM inventory WHERE id = ?', (item_id,)).fetchone()
+    conn.close()
+    return jsonify({'success': True, 'item': dict(updated)})
+
+
+def _delete_upload_file(image_url):
+    if not image_url:
+        return
+    name = os.path.basename(image_url)
+    if not name or name in {'.', '..'}:
+        return
+    path = os.path.join(UPLOAD_FOLDER, name)
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError as exc:
+        print(f"Could not delete upload {path}: {exc}")
+
+
+@app.route('/api/inventory/<int:item_id>', methods=['DELETE'])
+def delete_inventory(item_id):
+    conn = get_db_connection()
+    row = conn.execute('SELECT * FROM inventory WHERE id = ?', (item_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Item not found'}), 404
+
+    item = dict(row)
+    conn.execute('DELETE FROM inventory WHERE id = ?', (item_id,))
+    conn.commit()
+    conn.close()
+
+    _delete_upload_file(item.get('front_image_url'))
+    _delete_upload_file(item.get('back_image_url'))
+
+    return jsonify({'success': True, 'message': 'Device deleted'})
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
