@@ -46,19 +46,88 @@ COLORS = [
 LOCK_UNLOCKED = "Unlocked"
 LOCK_LOCKED = "Locked (FMI ON)"
 LOCK_SIGNAL = "Signal Bypassed"
+LOCK_MDM = "MDM Bypassed"
 LOCK_BYPASSED = "Bypassed"
 LOCK_SN = "SN Unlocked"
 LOCK_STATUSES = (
     LOCK_UNLOCKED,
     LOCK_LOCKED,
     LOCK_SIGNAL,
+    LOCK_MDM,
     LOCK_BYPASSED,
     LOCK_SN,
 )
 
+# QR/label values such as SN-Unlocked, Signal-Bypassed, MDM-Bypassed
+_LOCK_TOKEN_MAP = {
+    "U": LOCK_UNLOCKED,
+    "UNLOCKED": LOCK_UNLOCKED,
+    "L": LOCK_LOCKED,
+    "LOCKED": LOCK_LOCKED,
+    "LOCKEDFMION": LOCK_LOCKED,
+    "FMION": LOCK_LOCKED,
+    "SIGNALBYPASSED": LOCK_SIGNAL,
+    "SIGBYPASSED": LOCK_SIGNAL,
+    "SIGB": LOCK_SIGNAL,
+    "MDMBYPASSED": LOCK_MDM,
+    "MDMB": LOCK_MDM,
+    "B": LOCK_BYPASSED,
+    "BYPASSED": LOCK_BYPASSED,
+    "SNUNLOCKED": LOCK_SN,
+    "SNU": LOCK_SN,
+}
+
+
+def normalize_lock_token(value: str) -> str:
+    """Map a lock-status token from QR or OCR to the dropdown value."""
+    key = re.sub(r"[^A-Za-z0-9]", "", value or "").upper()
+    return _LOCK_TOKEN_MAP.get(key, "")
+
+
+def parse_comma_payload(text: str, min_fields: int = 8) -> dict | None:
+    """Parse comma-separated device label / QR payload.
+
+    Current: Model, Color, Capacity, Serial, iOS, IMEI, Battery, Date, Remarks, Lock
+    Legacy:  Model, Color, Capacity, Serial, iOS, IMEI, Battery, Date
+    Remarks sit after the date and before lock status, and may themselves contain commas.
+    """
+    parts = [p.strip() for p in (text or "").split(",")]
+    if len(parts) < min_fields:
+        return None
+
+    def at(index: int) -> str:
+        return parts[index] if index < len(parts) else ""
+
+    parsed = {
+        "model": at(0),
+        "color": at(1),
+        "capacity": at(2),
+        "serial_number": at(3),
+        "ios_version": at(4),
+        "imei": at(5),
+        "battery_health": at(6),
+        "date_received": at(7),
+        "remarks": "",
+        "lock_status": "",
+        "inventory_number": "",
+    }
+
+    extra = parts[8:]
+    lock_idx = None
+    for i in range(len(extra) - 1, -1, -1):
+        mapped = normalize_lock_token(extra[i])
+        if mapped:
+            parsed["lock_status"] = mapped
+            lock_idx = i
+            break
+
+    remark_parts = extra[:lock_idx] if lock_idx is not None else extra
+    parsed["remarks"] = ", ".join(p for p in remark_parts if p)
+    return parsed
+
 
 def parse_lock_status(raw_text: str, lines: list[str] | None = None) -> str:
-    """Map label codes: U, L, Sig-B, B, SN-U."""
+    """Map label codes: U, L, Sig-B, MDM-B, B, SN-U."""
     lines = lines or [ln.strip() for ln in (raw_text or "").splitlines() if ln.strip()]
 
     def token_key(value: str) -> str:
@@ -71,6 +140,8 @@ def parse_lock_status(raw_text: str, lines: list[str] | None = None) -> str:
             return LOCK_SN
         if key in {"SIGB", "SIGNALBYPASSED", "SIGBYPASS"}:
             return LOCK_SIGNAL
+        if key in {"MDMB", "MDMBYPASSED", "MDMBYPASS"}:
+            return LOCK_MDM
         if key in {"U", "UNLOCKED"}:
             return LOCK_UNLOCKED
         if key in {"L", "LOCKED", "FMION"}:
@@ -83,6 +154,8 @@ def parse_lock_status(raw_text: str, lines: list[str] | None = None) -> str:
         return LOCK_SN
     if re.search(r"\bsig(?:nal)?[\s\-]?b(?:ypassed)?\b", blob, re.I):
         return LOCK_SIGNAL
+    if re.search(r"\bmdm[\s\-]?b(?:ypassed)?\b", blob, re.I):
+        return LOCK_MDM
     if re.search(r"\bfmi\s*on\b|\blocked\b", blob, re.I):
         return LOCK_LOCKED
     if re.search(r"\bunlocked\b", blob, re.I):
@@ -97,6 +170,8 @@ def parse_lock_status(raw_text: str, lines: list[str] | None = None) -> str:
             return LOCK_SN
         if key in {"SIGB", "SIG-B"}:
             return LOCK_SIGNAL
+        if key in {"MDMB", "MDM-B"}:
+            return LOCK_MDM
     for token in tokens:
         if token.upper() == "U":
             return LOCK_UNLOCKED
@@ -174,22 +249,14 @@ def parse_label_text(raw_text: str, lines: list[str] | None = None) -> dict:
     lower = blob.lower()
     lines = lines or [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-    # Same comma-separated payload as the QR codes
-    comma_parts = [p.strip() for p in re.split(r"\s*,\s*", blob) if p.strip()]
+    # Same comma-separated payload as the QR codes (legacy 8-field or new 10-field)
+    comma_parts = [p.strip() for p in blob.split(",")]
     if len(comma_parts) >= 6 and re.search(r"iphone|ipad", comma_parts[0], re.I):
-        parsed = {
-            "model": comma_parts[0],
-            "color": comma_parts[1] if len(comma_parts) > 1 else "",
-            "capacity": comma_parts[2] if len(comma_parts) > 2 else "",
-            "serial_number": comma_parts[3] if len(comma_parts) > 3 else "",
-            "ios_version": comma_parts[4] if len(comma_parts) > 4 else "",
-            "imei": comma_parts[5] if len(comma_parts) > 5 else "",
-            "battery_health": comma_parts[6] if len(comma_parts) > 6 else "",
-            "date_received": comma_parts[7] if len(comma_parts) > 7 else "",
-            "inventory_number": "",
-        }
+        parsed = parse_comma_payload(blob, min_fields=6) or {}
         parsed["raw_ocr"] = raw_text
-        parsed["lock_status"] = parse_lock_status(raw_text, lines)
+        parsed["label_notes"] = parsed.get("remarks") or ""
+        if not parsed.get("lock_status"):
+            parsed["lock_status"] = parse_lock_status(raw_text, lines)
         return parsed
 
     parsed = {

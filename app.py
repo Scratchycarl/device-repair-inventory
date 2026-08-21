@@ -11,7 +11,7 @@ from pyzbar.pyzbar import decode as pyzbar_decode
 from database import init_db
 from vision import analyze_photos
 from repair_parts import determine_parts_needed as map_parts_needed
-from ocr_label import extract_label_fields
+from ocr_label import extract_label_fields, parse_comma_payload
 
 app = Flask(__name__, static_folder='static')
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max upload
@@ -158,26 +158,19 @@ def scan_qr_from_image(image_data_b64):
 def parse_qr_text(qr_text):
     """
     Parse QR text into structured fields.
-    Expected format: Model Name, Color, Capacity, Serial Number, iOS Version, IMEI, Battery Life, Date
+
+    Current: Model, Color, Capacity, Serial, iOS, IMEI, Battery, Date, Remarks, Lock Status
+    Legacy:  Model, Color, Capacity, Serial, iOS, IMEI, Battery, Date
     """
+    parsed = parse_comma_payload(qr_text)
+    if parsed:
+        return parsed
+
     parts = [p.strip() for p in qr_text.split(',')]
-    
-    if len(parts) >= 8:
-        return {
-            'model': parts[0],
-            'color': parts[1],
-            'capacity': parts[2],
-            'serial_number': parts[3],
-            'ios_version': parts[4],
-            'imei': parts[5],
-            'battery_health': parts[6],
-            'date_received': parts[7]
-        }
-    else:
-        return {
-            'model': parts[0] if parts else 'Unknown',
-            'raw_qr': qr_text
-        }
+    return {
+        'model': parts[0] if parts else 'Unknown',
+        'raw_qr': qr_text
+    }
 
 # ---- Routes ----
 
@@ -300,7 +293,7 @@ def add_inventory():
 
 @app.route('/api/inventory/<int:item_id>', methods=['PATCH'])
 def update_inventory(item_id):
-    """Update editable fields (parts list, remarks, condition)."""
+    """Update editable device fields, parts list, remarks, and condition."""
     data = request.json or {}
     conn = get_db_connection()
     row = conn.execute('SELECT id FROM inventory WHERE id = ?', (item_id,)).fetchone()
@@ -335,6 +328,22 @@ def update_inventory(item_id):
     if 'inventory_number' in data:
         fields.append('inventory_number = ?')
         values.append((data.get('inventory_number') or '').strip())
+
+    text_fields = (
+        'model',
+        'color',
+        'capacity',
+        'serial_number',
+        'ios_version',
+        'imei',
+        'battery_health',
+        'date_received',
+        'vision_device_type',
+    )
+    for key in text_fields:
+        if key in data:
+            fields.append(f'{key} = ?')
+            values.append((data.get(key) or '').strip())
 
     if not fields:
         conn.close()

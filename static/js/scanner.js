@@ -58,12 +58,13 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('val-inv').value = parsed.inventory_number || '';
         document.getElementById('val-date').value = parsed.date_received || '';
         const lockSelect = document.getElementById('val-lock-status');
-        lockSelect.value = parsed.lock_status || '';
+        lockSelect.value = normalizeLockStatus(parsed.lock_status);
         styleLockSelect(lockSelect);
-        if (parsed.label_notes) {
+        const note = parsed.remarks || parsed.label_notes || '';
+        if (note) {
             const remarks = document.getElementById('custom-remarks');
             if (!remarks.value.trim()) {
-                remarks.value = parsed.label_notes;
+                remarks.value = note;
             }
         }
     }
@@ -85,8 +86,40 @@ document.addEventListener('DOMContentLoaded', () => {
         };
     }
 
+    function normalizeLockStatus(status) {
+        const raw = String(status || '').trim();
+        if (!raw) return '';
+        const key = raw.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+        const map = {
+            UNLOCKED: 'Unlocked',
+            LOCKED: 'Locked (FMI ON)',
+            LOCKEDFMION: 'Locked (FMI ON)',
+            FMION: 'Locked (FMI ON)',
+            SIGNALBYPASSED: 'Signal Bypassed',
+            SIGBYPASSED: 'Signal Bypassed',
+            SIGB: 'Signal Bypassed',
+            MDMBYPASSED: 'MDM Bypassed',
+            MDMB: 'MDM Bypassed',
+            BYPASSED: 'Bypassed',
+            SNUNLOCKED: 'SN Unlocked',
+            SNU: 'SN Unlocked',
+        };
+        return map[key] || raw;
+    }
+
+    function isTabletFromModel(model) {
+        return /ipad|tablet/i.test(model || '');
+    }
+
+    function isBlockedLock(status, model) {
+        if (status === 'Locked (FMI ON)') return true;
+        if (status === 'Bypassed' && !isTabletFromModel(model)) return true;
+        return false;
+    }
+
     function styleLockSelect(select) {
-        const blocked = select.value === 'Locked (FMI ON)' || select.value === 'Bypassed';
+        const model = document.getElementById('val-model')?.value || '';
+        const blocked = isBlockedLock(select.value, model);
         select.classList.toggle('bg-red-50', blocked);
         select.classList.toggle('border-red-400', blocked);
         select.classList.toggle('text-red-800', blocked);
@@ -317,6 +350,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     document.getElementById('val-lock-status').addEventListener('change', (e) => {
         styleLockSelect(e.target);
+    });
+    document.getElementById('val-model').addEventListener('input', () => {
+        styleLockSelect(document.getElementById('val-lock-status'));
     });
 
     btnSubmit.addEventListener('click', async () => {

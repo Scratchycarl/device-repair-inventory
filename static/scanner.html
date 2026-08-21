@@ -121,10 +121,11 @@
                         <option value="Unlocked">Unlocked</option>
                         <option value="Locked (FMI ON)">Locked (FMI ON)</option>
                         <option value="Signal Bypassed">Signal Bypassed</option>
+                        <option value="MDM Bypassed">MDM Bypassed</option>
                         <option value="Bypassed">Bypassed</option>
                         <option value="SN Unlocked">SN Unlocked</option>
                     </select>
-                    <p class="text-xs text-gray-500 mt-1">OCR fills this from U / L / Sig-B / B / SN-U. Locked or Bypassed devices are excluded from the parts list.</p>
+                    <p class="text-xs text-gray-500 mt-1">OCR fills this from U / L / Sig-B / MDM-B / B / SN-U. Locked devices and Bypassed phones are excluded from the parts list. Bypassed tablets are included.</p>
                 </div>
 
                 <div id="qr-error" class="hidden mb-4 p-4 bg-red-50 border border-red-200 rounded-lg text-sm">
@@ -185,6 +186,6 @@
         </div>
     </div>
 
-    <script src="/static/js/scanner.js?v=20"></script>
+    <script src="/static/js/scanner.js?v=22"></script>
 </body>
 </html>

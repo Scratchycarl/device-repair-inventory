@@ -6,6 +6,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const panelParts = document.getElementById('panel-parts');
     const tabInventory = document.getElementById('tab-inventory');
     const tabParts = document.getElementById('tab-parts');
+    const searchInput = document.getElementById('inventory-search');
+    const searchStatus = document.getElementById('inventory-search-status');
     const modal = document.getElementById('detail-modal');
 
     const COMMON_PARTS = [
@@ -34,7 +36,8 @@ document.addEventListener('DOMContentLoaded', () => {
     ];
 
     const elements = {
-        modelName: document.getElementById('modal-model-name'),
+        title: document.getElementById('modal-title'),
+        model: document.getElementById('modal-model'),
         color: document.getElementById('modal-color'),
         capacity: document.getElementById('modal-capacity'),
         battery: document.getElementById('modal-battery'),
@@ -104,14 +107,49 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    function normalizeSearchValue(value) {
+        return String(value || '').toLowerCase().replace(/[\s\-]/g, '');
+    }
+
+    function matchesSearch(item, query) {
+        const raw = String(query || '').trim().toLowerCase();
+        if (!raw) return true;
+        const compact = raw.replace(/[\s\-]/g, '');
+        if (String(item.model || '').toLowerCase().includes(raw)) return true;
+        if (normalizeSearchValue(item.serial_number).includes(compact)) return true;
+        if (normalizeSearchValue(item.imei).includes(compact)) return true;
+        return false;
+    }
+
+    function filteredInventory() {
+        return inventoryData.filter((item) => matchesSearch(item, searchInput.value));
+    }
+
     function renderTable() {
+        const items = filteredInventory();
+        const query = searchInput.value.trim();
+        if (query) {
+            searchStatus.classList.remove('hidden');
+            searchStatus.textContent = items.length
+                ? `${items.length} match${items.length === 1 ? '' : 'es'}`
+                : 'No matching devices';
+        } else {
+            searchStatus.classList.add('hidden');
+            searchStatus.textContent = '';
+        }
+
         if (inventoryData.length === 0) {
             tableBody.innerHTML = `<tr><td colspan="6" class="px-6 py-4 text-center text-sm text-gray-500">No devices in inventory yet.</td></tr>`;
             return;
         }
 
-        tableBody.innerHTML = inventoryData.map((item) => {
-            const blocked = isBlockedLock(item.lock_status);
+        if (items.length === 0) {
+            tableBody.innerHTML = `<tr><td colspan="6" class="px-6 py-4 text-center text-sm text-gray-500">No devices match "${escapeHtml(query)}".</td></tr>`;
+            return;
+        }
+
+        tableBody.innerHTML = items.map((item) => {
+            const blocked = isBlockedLock(item.lock_status, item);
             const parts = parseParts(item.parts_needed);
             const partsStr = blocked
                 ? 'Excluded'
@@ -166,7 +204,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const aggregates = new Map();
 
         inventoryData.forEach((item) => {
-            if (isBlockedLock(item.lock_status)) return;
+            if (isBlockedLock(item.lock_status, item)) return;
             const parts = parseParts(item.parts_needed);
             const deviceLabel = `#${item.id} ${item.model || 'Unknown'}`.trim();
             parts.forEach((part) => {
@@ -207,12 +245,29 @@ document.addEventListener('DOMContentLoaded', () => {
         `).join('');
     }
 
-    function isBlockedLock(status) {
-        return status === 'Locked (FMI ON)' || status === 'Bypassed';
+    function isTablet(item) {
+        const type = String(item?.vision_device_type || '').toLowerCase();
+        if (type === 'tablet') return true;
+        return /ipad|tablet/i.test(item?.model || '');
+    }
+
+    function isBlockedLock(status, item) {
+        if (status === 'Locked (FMI ON)') return true;
+        if (status === 'Bypassed' && !isTablet(item)) return true;
+        return false;
+    }
+
+    function currentModalItem() {
+        const item = inventoryData.find((i) => i.id === currentItemId) || {};
+        return {
+            ...item,
+            model: elements.model.value,
+            vision_device_type: elements.visionType.value,
+        };
     }
 
     function styleLockSelect(select) {
-        const blocked = isBlockedLock(select.value);
+        const blocked = isBlockedLock(select.value, currentModalItem());
         select.classList.toggle('bg-red-50', blocked);
         select.classList.toggle('border-red-400', blocked);
         select.classList.toggle('text-red-800', blocked);
@@ -284,16 +339,24 @@ document.addEventListener('DOMContentLoaded', () => {
         currentItemId = item.id;
         currentParts = parseParts(item.parts_needed);
 
-        elements.modelName.innerText = item.model || 'Unknown Device';
-        elements.color.innerText = item.color || '-';
-        elements.capacity.innerText = item.capacity || '-';
-        elements.battery.innerText = item.battery_health || '-';
-        elements.inventoryNumber.innerText = item.inventory_number || '-';
-        elements.ios.innerText = item.ios_version || '-';
-        elements.serial.innerText = item.serial_number || '-';
-        elements.imei.innerText = item.imei || '-';
-        elements.date.innerText = item.date_received || '-';
-        elements.visionType.innerText = item.vision_device_type || '-';
+        elements.title.innerText = item.model ? item.model : `Device #${item.id}`;
+        elements.model.value = item.model || '';
+        elements.color.value = item.color || '';
+        elements.capacity.value = item.capacity || '';
+        elements.battery.value = item.battery_health || '';
+        elements.inventoryNumber.value = item.inventory_number || '';
+        elements.ios.value = item.ios_version || '';
+        elements.serial.value = item.serial_number || '';
+        elements.imei.value = item.imei || '';
+        elements.date.value = item.date_received || '';
+        elements.visionType.value = item.vision_device_type || '';
+        if (item.vision_device_type && elements.visionType.value !== item.vision_device_type) {
+            const extra = document.createElement('option');
+            extra.value = item.vision_device_type;
+            extra.textContent = item.vision_device_type;
+            elements.visionType.appendChild(extra);
+            elements.visionType.value = item.vision_device_type;
+        }
         elements.remarks.value = item.remarks || '';
         elements.condition.value = item.damage_condition || '';
         elements.lockStatus.value = item.lock_status || '';
@@ -353,6 +416,16 @@ document.addEventListener('DOMContentLoaded', () => {
                     remarks: elements.remarks.value,
                     damage_condition: elements.condition.value.trim(),
                     lock_status: elements.lockStatus.value,
+                    model: elements.model.value.trim(),
+                    color: elements.color.value.trim(),
+                    capacity: elements.capacity.value.trim(),
+                    serial_number: elements.serial.value.trim(),
+                    ios_version: elements.ios.value.trim(),
+                    imei: elements.imei.value.trim(),
+                    battery_health: elements.battery.value.trim(),
+                    date_received: elements.date.value.trim(),
+                    inventory_number: elements.inventoryNumber.value.trim(),
+                    vision_device_type: elements.visionType.value.trim(),
                 }),
             });
             const result = await res.json();
@@ -362,6 +435,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             const idx = inventoryData.findIndex((i) => i.id === currentItemId);
             if (idx >= 0) inventoryData[idx] = result.item;
+            elements.title.innerText = result.item.model || `Device #${currentItemId}`;
             renderTable();
             renderPartsSummary();
             elements.btnSave.textContent = 'Saved';
@@ -380,7 +454,7 @@ document.addEventListener('DOMContentLoaded', () => {
     async function deleteItem() {
         if (!currentItemId) return;
         const item = inventoryData.find((i) => i.id === currentItemId);
-        const label = item ? (item.model || `Device #${currentItemId}`) : `Device #${currentItemId}`;
+        const label = item ? (elements.model.value.trim() || item.model || `Device #${currentItemId}`) : `Device #${currentItemId}`;
         if (!confirm(`Delete ${label}? This cannot be undone.`)) return;
 
         elements.btnDelete.disabled = true;
@@ -439,7 +513,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
     tabInventory.addEventListener('click', () => setActiveTab('inventory'));
     tabParts.addEventListener('click', () => setActiveTab('parts'));
+    searchInput.addEventListener('input', renderTable);
     elements.lockStatus.addEventListener('change', () => styleLockSelect(elements.lockStatus));
+    elements.model.addEventListener('input', () => {
+        elements.title.innerText = elements.model.value.trim() || `Device #${currentItemId}`;
+        styleLockSelect(elements.lockStatus);
+    });
+    elements.visionType.addEventListener('change', () => styleLockSelect(elements.lockStatus));
 
     elements.btnSave.addEventListener('click', saveItem);
     elements.btnDelete.addEventListener('click', deleteItem);

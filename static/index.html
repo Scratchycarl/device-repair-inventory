@@ -49,8 +49,14 @@
         </div>
 
         <div id="panel-inventory" class="bg-white shadow rounded-lg overflow-hidden">
-            <div class="px-4 py-5 border-b border-gray-200">
-                <h3 class="text-lg leading-6 font-medium text-gray-900">Inventory Items</h3>
+            <div class="px-4 py-5 border-b border-gray-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                <div>
+                    <h3 class="text-lg leading-6 font-medium text-gray-900">Inventory Items</h3>
+                    <p id="inventory-search-status" class="text-sm text-gray-500 mt-1 hidden"></p>
+                </div>
+                <input type="search" id="inventory-search" placeholder="Search serial, model, or IMEI"
+                    class="w-full sm:w-80 border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-900 bg-white focus:ring-blue-500 focus:border-blue-500"
+                    autocomplete="off">
             </div>
             
             <div class="overflow-x-auto">
@@ -78,7 +84,7 @@
             <div class="px-4 py-5 border-b border-gray-200 flex flex-wrap items-center justify-between gap-2">
                 <div>
                     <h3 class="text-lg leading-6 font-medium text-gray-900">Parts Needed</h3>
-                    <p class="text-sm text-gray-500 mt-1">From devices that are not Locked or Bypassed</p>
+                    <p class="text-sm text-gray-500 mt-1">From devices that are not Locked. Bypassed phones are excluded; Bypassed tablets are included.</p>
                 </div>
                 <span id="parts-summary-count" class="text-sm text-gray-500"></span>
             </div>
@@ -111,7 +117,7 @@
             <div class="inline-block align-bottom bg-white rounded-lg text-left overflow-hidden shadow-xl transform transition-all sm:my-8 sm:align-middle sm:max-w-4xl sm:w-full">
                 <div class="bg-white px-4 pt-5 pb-4 sm:p-6 sm:pb-4">
                     <div class="flex justify-between items-center mb-5 border-b pb-3">
-                        <h3 class="text-2xl leading-6 font-bold text-gray-900" id="modal-model-name">Device Details</h3>
+                        <h3 class="text-2xl leading-6 font-bold text-gray-900" id="modal-title">Device Details</h3>
                         <button type="button" class="text-gray-400 hover:text-gray-500" id="btn-close-modal">
                             <span class="sr-only">Close</span>
                             <svg class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -123,16 +129,26 @@
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                         <div class="space-y-6">
                             <div class="bg-blue-50 p-4 rounded-lg border border-blue-100">
-                                <h4 class="text-sm font-bold text-blue-800 uppercase tracking-wider mb-3">Scanned Details</h4>
-                                <div class="grid grid-cols-2 gap-y-2 text-sm">
-                                    <div class="text-gray-500">Color:</div><div class="font-medium text-gray-900" id="modal-color"></div>
-                                    <div class="text-gray-500">Capacity:</div><div class="font-medium text-gray-900" id="modal-capacity"></div>
-                                    <div class="text-gray-500">Inv #:</div><div class="font-medium text-gray-900" id="modal-inv"></div>
-                                    <div class="text-gray-500">Battery Health:</div><div class="font-medium text-gray-900" id="modal-battery"></div>
-                                    <div class="text-gray-500">iOS Version:</div><div class="font-medium text-gray-900" id="modal-ios"></div>
-                                    <div class="text-gray-500">Serial:</div><div class="font-medium text-gray-900" id="modal-serial"></div>
-                                    <div class="text-gray-500">IMEI:</div><div class="font-medium text-gray-900" id="modal-imei"></div>
-                                    <div class="text-gray-500">Date Received:</div><div class="font-medium text-gray-900" id="modal-date"></div>
+                                <h4 class="text-sm font-bold text-blue-800 uppercase tracking-wider mb-3">Details</h4>
+                                <div class="grid grid-cols-2 gap-x-3 gap-y-2 text-sm items-center">
+                                    <div class="text-gray-500">Model:</div>
+                                    <input id="modal-model" class="w-full border border-blue-200 rounded px-2 py-1 text-sm text-gray-900 bg-white col-span-1">
+                                    <div class="text-gray-500">Color:</div>
+                                    <input id="modal-color" class="w-full border border-blue-200 rounded px-2 py-1 text-sm text-gray-900 bg-white">
+                                    <div class="text-gray-500">Capacity:</div>
+                                    <input id="modal-capacity" class="w-full border border-blue-200 rounded px-2 py-1 text-sm text-gray-900 bg-white">
+                                    <div class="text-gray-500">Inv #:</div>
+                                    <input id="modal-inv" class="w-full border border-blue-200 rounded px-2 py-1 text-sm text-gray-900 bg-white">
+                                    <div class="text-gray-500">Battery Health:</div>
+                                    <input id="modal-battery" class="w-full border border-blue-200 rounded px-2 py-1 text-sm text-gray-900 bg-white">
+                                    <div class="text-gray-500">iOS Version:</div>
+                                    <input id="modal-ios" class="w-full border border-blue-200 rounded px-2 py-1 text-sm text-gray-900 bg-white">
+                                    <div class="text-gray-500">Serial:</div>
+                                    <input id="modal-serial" class="w-full border border-blue-200 rounded px-2 py-1 text-sm text-gray-900 bg-white">
+                                    <div class="text-gray-500">IMEI:</div>
+                                    <input id="modal-imei" class="w-full border border-blue-200 rounded px-2 py-1 text-sm text-gray-900 bg-white">
+                                    <div class="text-gray-500">Date Received:</div>
+                                    <input id="modal-date" class="w-full border border-blue-200 rounded px-2 py-1 text-sm text-gray-900 bg-white">
                                     <div class="text-gray-500">Lock Status:</div>
                                     <div>
                                         <select id="modal-lock-status" class="w-full border border-blue-200 rounded px-2 py-1 text-sm text-gray-900 bg-white">
@@ -140,11 +156,18 @@
                                             <option value="Unlocked">Unlocked</option>
                                             <option value="Locked (FMI ON)">Locked (FMI ON)</option>
                                             <option value="Signal Bypassed">Signal Bypassed</option>
+                                            <option value="MDM Bypassed">MDM Bypassed</option>
                                             <option value="Bypassed">Bypassed</option>
                                             <option value="SN Unlocked">SN Unlocked</option>
                                         </select>
                                     </div>
-                                    <div class="text-gray-500">Vision type:</div><div class="font-medium text-gray-900" id="modal-vision-type"></div>
+                                    <div class="text-gray-500">Vision type:</div>
+                                    <select id="modal-vision-type" class="w-full border border-blue-200 rounded px-2 py-1 text-sm text-gray-900 bg-white">
+                                        <option value="">Select…</option>
+                                        <option value="phone">phone</option>
+                                        <option value="tablet">tablet</option>
+                                        <option value="unknown">unknown</option>
+                                    </select>
                                 </div>
                             </div>
 
@@ -226,6 +249,6 @@
         </div>
     </div>
 
-    <script src="/static/js/dashboard.js?v=17"></script>
+    <script src="/static/js/dashboard.js?v=19"></script>
 </body>
 </html>
