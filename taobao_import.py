@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import re
-import sqlite3
-import uuid
 from io import BytesIO
 from typing import Any
 
@@ -33,6 +31,16 @@ def _cell_str(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _pick_column(cells: list, col_map: dict[str, int], names: tuple[str, ...]) -> str:
+    for name in names:
+        idx = col_map.get(name)
+        if idx is not None and idx < len(cells):
+            value = _cell_str(cells[idx])
+            if value:
+                return value
+    return ""
 
 
 def _parse_header_row(sheet) -> tuple[int, dict[str, int]] | None:
@@ -99,6 +107,15 @@ def parse_taobao_xlsx(file_bytes: bytes) -> list[dict[str, Any]]:
                 and col_map["商品链接"] < len(cells)
                 else "",
                 "qty": qty,
+                "domestic_carrier": _pick_column(cells, col_map, (
+                    "物流公司", "快递公司", "承运公司",
+                )),
+                "domestic_tracking_number": _pick_column(cells, col_map, (
+                    "运单号", "快递单号", "物流单号", "物流编号",
+                )),
+                "logistics_status": _pick_column(cells, col_map, (
+                    "物流状态", "快递状态",
+                )),
                 "search_text": f"{product_name} {variant}".lower(),
             }
         )
@@ -182,138 +199,5 @@ def _part_names_match(job_part: str, inferred: str) -> bool:
     return False
 
 
-def apply_taobao_import(conn: sqlite3.Connection, file_bytes: bytes) -> dict[str, Any]:
-    orders = parse_taobao_xlsx(file_bytes)
-    batch_id = uuid.uuid4().hex
-    conn.execute(
-        "INSERT INTO taobao_import_batches (id, row_count) VALUES (?, ?)",
-        (batch_id, len(orders)),
-    )
+# Parsing only — import logic lives in taobao_import_apply.py
 
-    inventory_rows = conn.execute(
-        "SELECT id, model, parts_needed FROM inventory ORDER BY id ASC"
-    ).fetchall()
-    devices = [dict(r) for r in inventory_rows]
-
-    pending_jobs = conn.execute(
-        """
-        SELECT j.*, i.model AS device_model
-        FROM repair_jobs j
-        JOIN inventory i ON i.id = j.inventory_id
-        WHERE j.job_type = 'order_part' AND j.status = 'pending'
-        ORDER BY j.inventory_id ASC, j.sort_order ASC, j.id ASC
-        """
-    ).fetchall()
-    pending_list = [dict(r) for r in pending_jobs]
-
-    results: list[dict[str, Any]] = []
-    matched_count = 0
-
-    for order in orders:
-        order_tokens = extract_model_tokens(order["search_text"])
-        inferred_default = infer_part_from_text(order["search_text"])
-        matched_jobs: list[dict] = []
-        remaining = order["qty"]
-
-        already = conn.execute(
-            """
-            SELECT COUNT(*) AS c FROM taobao_import_rows
-            WHERE order_id = ? AND product_name = ? AND variant = ? AND matched_job_ids IS NOT NULL AND matched_job_ids != ''
-            """,
-            (order["order_id"], order["product_name"], order["variant"]),
-        ).fetchone()["c"]
-        if already >= order["qty"]:
-            results.append(
-                {
-                    **order,
-                    "status": "skipped_duplicate",
-                    "matched_jobs": [],
-                    "inferred_part": inferred_default,
-                }
-            )
-            continue
-
-        for job in pending_list:
-            if remaining <= 0:
-                break
-            if job["status"] != "pending":
-                continue
-            if job.get("taobao_order_id") == order["order_id"]:
-                continue
-            if not models_compatible(job["device_model"] or "", order_tokens):
-                continue
-            inferred = infer_part_from_text(
-                order["search_text"], device_model=job["device_model"]
-            )
-            if not inferred:
-                inferred = inferred_default
-            if not _part_names_match(job["part_name"] or "", inferred or ""):
-                continue
-
-            conn.execute(
-                """
-                UPDATE repair_jobs
-                SET status = 'done',
-                    completed_at = datetime('now'),
-                    taobao_order_id = ?,
-                    taobao_product_name = ?
-                WHERE id = ?
-                """,
-                (order["order_id"], order["product_name"], job["id"]),
-            )
-            job["status"] = "done"
-            matched_jobs.append(
-                {
-                    "job_id": job["id"],
-                    "inventory_id": job["inventory_id"],
-                    "part_name": job["part_name"],
-                    "device_model": job["device_model"],
-                }
-            )
-            remaining -= 1
-            matched_count += 1
-
-        status = "matched" if matched_jobs else "unmatched"
-        row_id = conn.execute(
-            """
-            INSERT INTO taobao_import_rows (
-                batch_id, order_id, order_date, order_status, shop_name,
-                product_name, variant, product_link, qty,
-                inferred_part, match_status, matched_job_ids
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                batch_id,
-                order["order_id"],
-                order.get("order_date", ""),
-                order.get("order_status", ""),
-                order.get("shop_name", ""),
-                order["product_name"],
-                order["variant"],
-                order.get("product_link", ""),
-                order["qty"],
-                inferred_default or "",
-                status,
-                ",".join(str(m["job_id"]) for m in matched_jobs),
-            ),
-        ).lastrowid
-
-        results.append(
-            {
-                **order,
-                "row_id": row_id,
-                "status": status,
-                "matched_jobs": matched_jobs,
-                "inferred_part": inferred_default,
-                "unmatched_qty": max(0, order["qty"] - len(matched_jobs)),
-            }
-        )
-
-    conn.commit()
-    return {
-        "batch_id": batch_id,
-        "total_rows": len(orders),
-        "matched_count": matched_count,
-        "results": results,
-        "device_count": len(devices),
-    }

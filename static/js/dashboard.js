@@ -17,6 +17,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const customJobInput = document.getElementById('custom-job-input');
     const btnAddJob = document.getElementById('btn-add-job');
     const taobaoModal = document.getElementById('taobao-modal');
+    const shippingModal = document.getElementById('shipping-modal');
+    const warehouseModal = document.getElementById('warehouse-modal');
+
+    let activePartOrderId = null;
 
     const SCREEN_PARTS = new Set(['OLED Assembly', 'LCD Assembly', 'Digitizer', 'Display Assembly']);
 
@@ -241,23 +245,40 @@ document.addEventListener('DOMContentLoaded', () => {
 
         jobList.innerHTML = deviceJobs.map((job) => {
             const done = job.status === 'done';
-            const taobaoHint = job.taobao_order_id
-                ? `<span class="text-xs text-emerald-600 block mt-0.5">Taobao ${escapeHtml(job.taobao_order_id)}</span>`
+            const po = job.part_order;
+            const shipBadge = po
+                ? `<span class="inline-block mt-1 text-xs px-2 py-0.5 rounded-full bg-sky-100 text-sky-800">${escapeHtml(po.shipping_label || po.shipping_stage)}</span>`
+                : '';
+            const taobaoHint = po?.taobao_order_id
+                ? `<span class="text-xs text-emerald-600 block mt-0.5">Taobao ${escapeHtml(po.taobao_order_id)}</span>`
+                : (job.taobao_order_id ? `<span class="text-xs text-emerald-600 block mt-0.5">Taobao ${escapeHtml(job.taobao_order_id)}</span>` : '');
+            const trackBtn = po
+                ? `<button type="button" class="btn-track-order text-xs text-blue-700 hover:underline mt-1" data-part-order-id="${po.id}">Shipping details</button>`
                 : '';
             return `
-                <label class="flex items-start gap-3 p-2 rounded-lg border ${done ? 'border-gray-200 bg-gray-50' : 'border-gray-200 bg-white hover:bg-blue-50'} cursor-pointer">
-                    <input type="checkbox" class="job-checkbox mt-1 rounded border-gray-300 text-blue-600" data-job-id="${job.id}" ${done ? 'checked' : ''}>
-                    <span class="flex-1 min-w-0">
-                        <span class="text-sm ${done ? 'job-done' : 'text-gray-900'}">${escapeHtml(job.title)}</span>
-                        ${taobaoHint}
-                    </span>
-                    ${job.job_type === 'custom' ? `<button type="button" class="btn-delete-job text-xs text-red-500 hover:text-red-700" data-job-id="${job.id}">Del</button>` : ''}
-                </label>
+                <div class="flex items-start gap-3 p-2 rounded-lg border ${done ? 'border-gray-200 bg-gray-50' : 'border-gray-200 bg-white hover:bg-blue-50'}">
+                    <label class="flex items-start gap-3 flex-1 cursor-pointer min-w-0">
+                        <input type="checkbox" class="job-checkbox mt-1 rounded border-gray-300 text-blue-600 shrink-0" data-job-id="${job.id}" ${done ? 'checked' : ''}>
+                        <span class="flex-1 min-w-0">
+                            <span class="text-sm ${done ? 'job-done' : 'text-gray-900'}">${escapeHtml(job.title)}</span>
+                            ${taobaoHint}
+                            ${shipBadge}
+                            ${trackBtn}
+                        </span>
+                    </label>
+                    ${job.job_type === 'custom' ? `<button type="button" class="btn-delete-job text-xs text-red-500 hover:text-red-700 shrink-0" data-job-id="${job.id}">Del</button>` : ''}
+                </div>
             `;
         }).join('');
 
         jobList.querySelectorAll('.job-checkbox').forEach((cb) => {
             cb.addEventListener('change', () => toggleJob(parseInt(cb.dataset.jobId, 10), cb.checked));
+        });
+        jobList.querySelectorAll('.btn-track-order').forEach((btn) => {
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                openShippingModal(parseInt(btn.dataset.partOrderId, 10));
+            });
         });
         jobList.querySelectorAll('.btn-delete-job').forEach((btn) => {
             btn.addEventListener('click', (e) => {
@@ -327,6 +348,122 @@ document.addEventListener('DOMContentLoaded', () => {
         const res = await fetch('/api/inventory');
         inventoryData = await res.json();
         renderPartsSummary();
+    }
+
+    async function openShippingModal(partOrderId) {
+        activePartOrderId = partOrderId;
+        shippingModal.classList.remove('hidden');
+        await renderShippingModal();
+    }
+
+    function closeShippingModal() {
+        shippingModal.classList.add('hidden');
+        activePartOrderId = null;
+    }
+
+    async function renderShippingModal() {
+        if (!activePartOrderId) return;
+        const res = await fetch(`/api/part-orders/${activePartOrderId}`);
+        const data = await res.json();
+        if (!res.ok) {
+            alert(data.message || 'Failed to load shipping');
+            return;
+        }
+        const po = data.part_order;
+        document.getElementById('shipping-modal-title').textContent = po.part_name || 'Part order';
+        document.getElementById('shipping-modal-subtitle').textContent =
+            `#${po.device_id} ${po.device_model || ''} · Taobao ${po.taobao_order_id}`;
+        document.getElementById('shipping-stage-select').value = po.shipping_stage || 'ordered';
+
+        const stepsEl = document.getElementById('shipping-steps');
+        stepsEl.innerHTML = (po.shipping_steps || []).map((step) => {
+            const cls = step.completed ? 'ship-step-done' : (step.current ? 'ship-step-current' : 'text-gray-700');
+            let detail = '';
+            if (step.stage === 'transit_warehouse' && (step.tracking_number || step.carrier)) {
+                detail = `<div class="text-xs text-gray-500 mt-1 ml-6">${escapeHtml(step.carrier || 'Carrier TBD')} · ${escapeHtml(step.tracking_number || 'No tracking yet')}</div>`;
+            }
+            if (step.stage === 'transit_to_you' && step.tracking_number) {
+                detail = `<div class="text-xs text-gray-500 mt-1 ml-6">Warehouse shipment: ${escapeHtml(step.carrier || '')} ${escapeHtml(step.tracking_number)}</div>`;
+            }
+            return `<li class="text-sm ${cls}">${step.completed ? '✓' : (step.current ? '●' : '○')} ${escapeHtml(step.label)}${detail}</li>`;
+        }).join('');
+
+        const trackPanel = document.getElementById('shipping-tracking-panel');
+        const transitStep = (po.shipping_steps || []).find((s) => s.stage === 'transit_warehouse');
+        const events = transitStep?.events || [];
+        if (po.domestic_tracking_number || events.length) {
+            trackPanel.classList.remove('hidden');
+            const eventHtml = events.length
+                ? events.map((ev) => `<div class="py-1 border-b border-gray-200 last:border-0"><span class="text-gray-400">${escapeHtml(ev.time)}</span> ${escapeHtml(ev.context)}</div>`).join('')
+                : '<p class="text-gray-500 italic">No carrier updates yet. Import an updated sheet with tracking or click Refresh.</p>';
+            trackPanel.innerHTML = `<p class="font-semibold mb-2">Domestic carrier updates</p>${eventHtml}`;
+        } else {
+            trackPanel.classList.add('hidden');
+            trackPanel.innerHTML = '';
+        }
+    }
+
+    async function openWarehouseModal() {
+        warehouseModal.classList.remove('hidden');
+        await loadWarehouseModal();
+    }
+
+    function closeWarehouseModal() {
+        warehouseModal.classList.add('hidden');
+    }
+
+    async function loadWarehouseModal() {
+        const [assignRes, shipRes] = await Promise.all([
+            fetch('/api/part-orders/assignable'),
+            fetch('/api/warehouse-shipments'),
+        ]);
+        const assignData = await assignRes.json();
+        const shipData = await shipRes.json();
+        const listEl = document.getElementById('wh-assignable-list');
+        const orders = assignData.part_orders || [];
+        if (!orders.length) {
+            listEl.innerHTML = '<p class="text-gray-400 italic p-2">No unassigned ordered parts.</p>';
+        } else {
+            listEl.innerHTML = orders.map((po) => `
+                <label class="flex items-center gap-2 p-1 hover:bg-gray-50 rounded cursor-pointer">
+                    <input type="checkbox" class="wh-part-cb rounded" value="${po.id}">
+                    <span>#${po.inventory_id} ${escapeHtml(po.device_model || '')} · ${escapeHtml(po.part_name || '')} <span class="text-gray-400">(${escapeHtml(po.shipping_stage)})</span></span>
+                </label>
+            `).join('');
+        }
+        const shipList = document.getElementById('wh-shipment-list');
+        const shipments = shipData.shipments || [];
+        if (!shipments.length) {
+            shipList.innerHTML = '<p class="text-gray-400 italic">No warehouse shipments yet.</p>';
+        } else {
+            shipList.innerHTML = shipments.map((s) => `
+                <div class="border rounded-lg p-3">
+                    <div class="font-medium">${escapeHtml(s.tracking_number)} ${s.carrier ? '· ' + escapeHtml(s.carrier) : ''}</div>
+                    <div class="text-gray-500 text-xs">${s.item_count || 0} part(s) · ${escapeHtml(s.status)}</div>
+                </div>
+            `).join('');
+        }
+    }
+
+    async function createWarehouseShipment() {
+        const tracking = document.getElementById('wh-tracking').value.trim();
+        const carrier = document.getElementById('wh-carrier').value.trim();
+        const notes = document.getElementById('wh-notes').value.trim();
+        const ids = [...document.querySelectorAll('.wh-part-cb:checked')].map((cb) => parseInt(cb.value, 10));
+        if (!tracking) { alert('Enter a tracking number'); return; }
+        if (!ids.length) { alert('Select at least one part'); return; }
+        const res = await fetch('/api/warehouse-shipments', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tracking_number: tracking, carrier, notes, part_order_ids: ids }),
+        });
+        const data = await res.json();
+        if (!res.ok) { alert(data.message || 'Failed'); return; }
+        document.getElementById('wh-tracking').value = '';
+        document.getElementById('wh-carrier').value = '';
+        document.getElementById('wh-notes').value = '';
+        await loadWarehouseModal();
+        if (selectedDeviceId) await loadJobsForDevice(selectedDeviceId);
     }
 
     function renderTable() {
@@ -766,6 +903,33 @@ document.addEventListener('DOMContentLoaded', () => {
         taobaoModal.classList.remove('hidden');
         document.getElementById('taobao-results').classList.add('hidden');
     });
+    document.getElementById('btn-warehouse-shipments').addEventListener('click', openWarehouseModal);
+    document.getElementById('btn-warehouse-close').addEventListener('click', closeWarehouseModal);
+    document.getElementById('warehouse-overlay').addEventListener('click', closeWarehouseModal);
+    document.getElementById('btn-wh-create').addEventListener('click', createWarehouseShipment);
+    document.getElementById('btn-shipping-close').addEventListener('click', closeShippingModal);
+    document.getElementById('shipping-overlay').addEventListener('click', closeShippingModal);
+    document.getElementById('btn-shipping-refresh').addEventListener('click', async () => {
+        if (!activePartOrderId) return;
+        const res = await fetch(`/api/part-orders/${activePartOrderId}/refresh-tracking`, { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) { alert(data.message || 'Refresh failed'); return; }
+        await renderShippingModal();
+        if (selectedDeviceId) await loadJobsForDevice(selectedDeviceId);
+    });
+    document.getElementById('btn-shipping-save-stage').addEventListener('click', async () => {
+        if (!activePartOrderId) return;
+        const stage = document.getElementById('shipping-stage-select').value;
+        const res = await fetch(`/api/part-orders/${activePartOrderId}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ shipping_stage: stage }),
+        });
+        const data = await res.json();
+        if (!res.ok) { alert(data.message || 'Update failed'); return; }
+        await renderShippingModal();
+        if (selectedDeviceId) await loadJobsForDevice(selectedDeviceId);
+    });
     document.getElementById('btn-taobao-close').addEventListener('click', () => taobaoModal.classList.add('hidden'));
     document.getElementById('taobao-overlay').addEventListener('click', () => taobaoModal.classList.add('hidden'));
     document.getElementById('btn-taobao-upload').addEventListener('click', async () => {
@@ -790,12 +954,16 @@ document.addEventListener('DOMContentLoaded', () => {
             const lines = (data.results || []).map((r) => {
                 if (r.status === 'matched') {
                     const jobs = (r.matched_jobs || []).map((m) => `#${m.inventory_id} ${m.part_name}`).join(', ');
-                    return `✅ ${escapeHtml(r.product_name.slice(0, 40))}… → ${jobs}`;
+                    return `✅ New: ${escapeHtml(r.product_name.slice(0, 40))}… → ${jobs}`;
                 }
-                if (r.status === 'skipped_duplicate') return `⏭ ${escapeHtml(r.order_id)} (already imported)`;
+                if (r.status === 'updated') {
+                    const jobs = (r.updated_bindings || []).map((m) => `#${m.inventory_id} ${m.part_name}`).join(', ');
+                    return `🔄 Updated: ${escapeHtml(r.order_id)} → ${jobs}`;
+                }
+                if (r.status === 'skipped_duplicate') return `⏭ ${escapeHtml(r.order_id)} (already bound)`;
                 return `❌ ${escapeHtml(r.product_name.slice(0, 40))}… — no match (${escapeHtml(r.inferred_part || 'unknown part')})`;
             });
-            resultsEl.innerHTML = `<p class="font-semibold mb-2">Matched ${data.matched_count} of ${data.total_rows} rows</p>${lines.map((l) => `<div class="py-1 border-b border-gray-200 last:border-0">${l}</div>`).join('')}`;
+            resultsEl.innerHTML = `<p class="font-semibold mb-2">Matched ${data.matched_count}, updated ${data.updated_count || 0} of ${data.total_rows} rows</p>${lines.map((l) => `<div class="py-1 border-b border-gray-200 last:border-0">${l}</div>`).join('')}`;
         } catch (err) {
             alert(err.message || 'Import failed');
         } finally {

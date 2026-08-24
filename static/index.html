@@ -18,6 +18,8 @@
         .table-row-hover:hover { background-color: #f3f4f6; cursor: pointer; }
         .table-row-selected { background-color: #eff6ff !important; outline: 2px solid #3b82f6; outline-offset: -2px; }
         .job-done { text-decoration: line-through; color: #9ca3af; }
+        .ship-step-done { text-decoration: line-through; color: #6b7280; }
+        .ship-step-current { font-weight: 600; color: #1d4ed8; }
     </style>
 </head>
 <body class="bg-gray-100 font-sans text-gray-800">
@@ -29,6 +31,9 @@
                     <h1 class="text-xl font-bold">Repair Inventory Dashboard</h1>
                 </div>
                 <div class="flex items-center gap-2">
+                    <button type="button" id="btn-warehouse-shipments" class="bg-indigo-600 hover:bg-indigo-500 px-4 py-2 rounded text-sm font-medium transition">
+                        Warehouse Shipments
+                    </button>
                     <button type="button" id="btn-taobao-import" class="bg-emerald-600 hover:bg-emerald-500 px-4 py-2 rounded text-sm font-medium transition">
                         Import Taobao
                     </button>
@@ -289,7 +294,7 @@
             <div class="fixed inset-0 bg-gray-500 bg-opacity-75" id="taobao-overlay"></div>
             <div class="relative bg-white rounded-lg shadow-xl max-w-2xl w-full p-6">
                 <h3 class="text-lg font-bold text-gray-900 mb-2">Import Taobao Orders</h3>
-                <p class="text-sm text-gray-500 mb-4">Upload a Taobao order export (.xlsx). Matching rows auto-check pending <strong>Order …</strong> jobs (qty applies across devices).</p>
+                <p class="text-sm text-gray-500 mb-4">Upload an updated export anytime — existing order bindings refresh status/tracking instead of reassigning to new devices.</p>
                 <input type="file" id="taobao-file" accept=".xlsx,.xlsm" class="block w-full text-sm text-gray-600 mb-4">
                 <div id="taobao-results" class="hidden max-h-64 overflow-y-auto text-sm border rounded-lg p-3 bg-gray-50 mb-4"></div>
                 <div class="flex justify-end gap-2">
@@ -300,6 +305,64 @@
         </div>
     </div>
 
-    <script src="/static/js/dashboard.js?v=20"></script>
+    <!-- Part order shipping detail -->
+    <div id="shipping-modal" class="hidden fixed inset-0 z-30 overflow-y-auto">
+        <div class="flex items-center justify-center min-h-screen px-4 py-8">
+            <div class="fixed inset-0 bg-gray-500 bg-opacity-75" id="shipping-overlay"></div>
+            <div class="relative bg-white rounded-lg shadow-xl max-w-lg w-full p-6 max-h-[90vh] overflow-y-auto">
+                <div class="flex justify-between items-start mb-4">
+                    <div>
+                        <h3 class="text-lg font-bold text-gray-900" id="shipping-modal-title">Order shipping</h3>
+                        <p class="text-sm text-gray-500" id="shipping-modal-subtitle"></p>
+                    </div>
+                    <button type="button" id="btn-shipping-close" class="text-gray-400 hover:text-gray-600 text-xl leading-none">&times;</button>
+                </div>
+                <ol id="shipping-steps" class="space-y-4 mb-4"></ol>
+                <div id="shipping-tracking-panel" class="hidden border rounded-lg p-3 bg-gray-50 text-sm mb-4"></div>
+                <div class="flex flex-wrap gap-2 justify-end">
+                    <button type="button" id="btn-shipping-refresh" class="px-3 py-2 text-sm border rounded-lg hover:bg-gray-50">Refresh carrier updates</button>
+                    <select id="shipping-stage-select" class="border rounded-lg px-3 py-2 text-sm">
+                        <option value="ordered">Ordered</option>
+                        <option value="transit_warehouse">In transit to warehouse</option>
+                        <option value="in_warehouse">In warehouse</option>
+                        <option value="transit_to_you">In transit to you</option>
+                        <option value="delivered">Delivered</option>
+                    </select>
+                    <button type="button" id="btn-shipping-save-stage" class="px-3 py-2 text-sm bg-blue-600 text-white rounded-lg">Update stage</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Warehouse outbound shipments -->
+    <div id="warehouse-modal" class="hidden fixed inset-0 z-20 overflow-y-auto">
+        <div class="flex items-center justify-center min-h-screen px-4 py-8">
+            <div class="fixed inset-0 bg-gray-500 bg-opacity-75" id="warehouse-overlay"></div>
+            <div class="relative bg-white rounded-lg shadow-xl max-w-3xl w-full p-6 max-h-[90vh] overflow-y-auto">
+                <h3 class="text-lg font-bold text-gray-900 mb-1">Warehouse → You shipments</h3>
+                <p class="text-sm text-gray-500 mb-4">Create a shipment with a tracking number and assign parts you've already ordered.</p>
+
+                <div class="border rounded-lg p-4 mb-6 bg-gray-50">
+                    <h4 class="text-sm font-semibold mb-2">New shipment</h4>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-3">
+                        <input type="text" id="wh-tracking" placeholder="Tracking number" class="border rounded-lg px-3 py-2 text-sm">
+                        <input type="text" id="wh-carrier" placeholder="Carrier (optional)" class="border rounded-lg px-3 py-2 text-sm">
+                    </div>
+                    <input type="text" id="wh-notes" placeholder="Notes (optional)" class="border rounded-lg px-3 py-2 text-sm w-full mb-3">
+                    <p class="text-xs font-semibold text-gray-500 uppercase mb-2">Assign ordered parts</p>
+                    <div id="wh-assignable-list" class="max-h-40 overflow-y-auto border rounded-lg bg-white p-2 text-sm space-y-1 mb-3"></div>
+                    <button type="button" id="btn-wh-create" class="px-4 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700">Create shipment</button>
+                </div>
+
+                <h4 class="text-sm font-semibold mb-2">Existing shipments</h4>
+                <div id="wh-shipment-list" class="space-y-2 text-sm"></div>
+                <div class="flex justify-end mt-4">
+                    <button type="button" id="btn-warehouse-close" class="px-4 py-2 text-sm border rounded-lg hover:bg-gray-50">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/dashboard.js?v=21"></script>
 </body>
 </html>

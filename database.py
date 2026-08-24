@@ -81,7 +81,57 @@ def init_db():
     )
     ''')
 
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS warehouse_shipments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tracking_number TEXT NOT NULL,
+        carrier TEXT,
+        notes TEXT,
+        status TEXT NOT NULL DEFAULT 'in_transit',
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now'))
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS part_orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repair_job_id INTEGER NOT NULL UNIQUE,
+        inventory_id INTEGER NOT NULL,
+        taobao_order_id TEXT NOT NULL,
+        product_name TEXT NOT NULL,
+        variant TEXT,
+        part_name TEXT,
+        taobao_order_status TEXT,
+        shipping_stage TEXT NOT NULL DEFAULT 'ordered',
+        domestic_carrier TEXT,
+        domestic_tracking_number TEXT,
+        domestic_tracking_json TEXT,
+        domestic_tracking_updated_at TEXT,
+        warehouse_shipment_id INTEGER,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (repair_job_id) REFERENCES repair_jobs(id) ON DELETE CASCADE,
+        FOREIGN KEY (inventory_id) REFERENCES inventory(id) ON DELETE CASCADE,
+        FOREIGN KEY (warehouse_shipment_id) REFERENCES warehouse_shipments(id)
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE INDEX IF NOT EXISTS idx_part_orders_taobao_line
+    ON part_orders (taobao_order_id, product_name, variant)
+    ''')
+
     conn.commit()
+
+    conn.row_factory = sqlite3.Row
+    try:
+        from part_orders import migrate_legacy_bindings
+        migrate_legacy_bindings(conn)
+        conn.commit()
+    except Exception as exc:
+        print(f"part_orders migration note: {exc}")
+
     conn.close()
     print("Database initialized.")
 
