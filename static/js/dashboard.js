@@ -7,8 +7,18 @@ document.addEventListener('DOMContentLoaded', () => {
     const tabInventory = document.getElementById('tab-inventory');
     const tabParts = document.getElementById('tab-parts');
     const searchInput = document.getElementById('inventory-search');
+    const sortSelect = document.getElementById('inventory-sort');
     const searchStatus = document.getElementById('inventory-search-status');
     const modal = document.getElementById('detail-modal');
+    const jobList = document.getElementById('job-list');
+    const jobPanelSubtitle = document.getElementById('job-panel-subtitle');
+    const jobPanelFooter = document.getElementById('job-panel-footer');
+    const btnOpenDevice = document.getElementById('btn-open-device');
+    const customJobInput = document.getElementById('custom-job-input');
+    const btnAddJob = document.getElementById('btn-add-job');
+    const taobaoModal = document.getElementById('taobao-modal');
+
+    const SCREEN_PARTS = new Set(['OLED Assembly', 'LCD Assembly', 'Digitizer', 'Display Assembly']);
 
     const COMMON_PARTS = [
         'OLED Assembly',
@@ -19,6 +29,7 @@ document.addEventListener('DOMContentLoaded', () => {
         'Back Cover',
         'Back Housing',
         'Replacement Battery',
+        'LiDAR Module',
         'Camera Module',
         'Rear Camera Glass',
         'WiFi Antenna',
@@ -66,6 +77,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     let inventoryData = [];
     let currentItemId = null;
+    let selectedDeviceId = null;
+    let deviceJobs = [];
     let currentParts = [];
 
     elements.commonPartsList.innerHTML = COMMON_PARTS
@@ -101,9 +114,16 @@ document.addEventListener('DOMContentLoaded', () => {
             inventoryData = await res.json();
             renderTable();
             renderPartsSummary();
+            if (!selectedDeviceId && inventoryData.length > 0) {
+                const sorted = sortInventoryItems(inventoryData);
+                const needsRepair = sorted.find((i) => (i.pending_jobs || 0) > 0);
+                selectDevice((needsRepair || sorted[0]).id);
+            } else if (selectedDeviceId) {
+                loadJobsForDevice(selectedDeviceId);
+            }
         } catch (error) {
             console.error('Error fetching inventory:', error);
-            tableBody.innerHTML = `<tr><td colspan="6" class="px-6 py-4 text-center text-sm text-red-500">Failed to load inventory.</td></tr>`;
+            tableBody.innerHTML = `<tr><td colspan="7" class="px-6 py-4 text-center text-sm text-red-500">Failed to load inventory.</td></tr>`;
         }
     }
 
@@ -121,8 +141,192 @@ document.addEventListener('DOMContentLoaded', () => {
         return false;
     }
 
+    function parseParts(raw) {
+        try {
+            const parsed = typeof raw === 'string' ? JSON.parse(raw || '[]') : (raw || []);
+            if (!Array.isArray(parsed)) return [];
+            return parsed.map((item) => {
+                if (typeof item === 'string') {
+                    const name = item.trim();
+                    return name ? { name, needs_programming: false } : null;
+                }
+                if (item && typeof item === 'object') {
+                    const name = String(item.name || '').trim();
+                    if (!name) return null;
+                    return { name, needs_programming: Boolean(item.needs_programming) };
+                }
+                return null;
+            }).filter(Boolean);
+        } catch (e) {
+            return [];
+        }
+    }
+
+    function partNamesFromRaw(raw) {
+        return parseParts(raw).map((p) => p.name);
+    }
+
+    function sortInventoryItems(items) {
+        const mode = sortSelect.value || 'needs_repair';
+        const sorted = [...items];
+        sorted.sort((a, b) => {
+            if (mode === 'needs_repair') {
+                const aPending = a.pending_jobs || 0;
+                const bPending = b.pending_jobs || 0;
+                if (aPending > 0 && bPending === 0) return -1;
+                if (bPending > 0 && aPending === 0) return 1;
+                if (bPending !== aPending) return bPending - aPending;
+                return (b.id || 0) - (a.id || 0);
+            }
+            if (mode === 'date_asc') {
+                return String(a.date_received || '').localeCompare(String(b.date_received || '')) || a.id - b.id;
+            }
+            if (mode === 'model') {
+                return String(a.model || '').localeCompare(String(b.model || '')) || a.id - b.id;
+            }
+            // date_desc default
+            return String(b.date_received || '').localeCompare(String(a.date_received || '')) || b.id - a.id;
+        });
+        return sorted;
+    }
+
     function filteredInventory() {
-        return inventoryData.filter((item) => matchesSearch(item, searchInput.value));
+        return sortInventoryItems(inventoryData.filter((item) => matchesSearch(item, searchInput.value)));
+    }
+
+    async function loadJobsForDevice(deviceId) {
+        if (!deviceId) {
+            deviceJobs = [];
+            renderJobPanel();
+            return;
+        }
+        try {
+            const res = await fetch(`/api/inventory/${deviceId}/jobs`);
+            const data = await res.json();
+            deviceJobs = data.jobs || [];
+            renderJobPanel();
+        } catch (err) {
+            console.error('Failed to load jobs', err);
+            jobList.innerHTML = '<p class="text-sm text-red-500">Failed to load jobs.</p>';
+        }
+    }
+
+    function selectDevice(deviceId) {
+        selectedDeviceId = deviceId;
+        renderTable();
+        loadJobsForDevice(deviceId);
+    }
+
+    function renderJobPanel() {
+        const item = inventoryData.find((i) => i.id === selectedDeviceId);
+        if (!item) {
+            jobPanelSubtitle.textContent = 'Select a device to view its checklist.';
+            btnOpenDevice.classList.add('hidden');
+            jobPanelFooter.classList.add('hidden');
+            jobList.innerHTML = '<p class="text-sm text-gray-400 italic">No device selected.</p>';
+            return;
+        }
+
+        const label = item.model || `Device #${item.id}`;
+        const pending = item.pending_jobs || 0;
+        const total = item.total_jobs || 0;
+        jobPanelSubtitle.textContent = `${label} · ${pending} pending / ${total} total`;
+        btnOpenDevice.classList.remove('hidden');
+        jobPanelFooter.classList.remove('hidden');
+
+        if (deviceJobs.length === 0) {
+            jobList.innerHTML = '<p class="text-sm text-gray-400 italic">No jobs yet. Save parts on this device to generate tasks.</p>';
+            return;
+        }
+
+        jobList.innerHTML = deviceJobs.map((job) => {
+            const done = job.status === 'done';
+            const taobaoHint = job.taobao_order_id
+                ? `<span class="text-xs text-emerald-600 block mt-0.5">Taobao ${escapeHtml(job.taobao_order_id)}</span>`
+                : '';
+            return `
+                <label class="flex items-start gap-3 p-2 rounded-lg border ${done ? 'border-gray-200 bg-gray-50' : 'border-gray-200 bg-white hover:bg-blue-50'} cursor-pointer">
+                    <input type="checkbox" class="job-checkbox mt-1 rounded border-gray-300 text-blue-600" data-job-id="${job.id}" ${done ? 'checked' : ''}>
+                    <span class="flex-1 min-w-0">
+                        <span class="text-sm ${done ? 'job-done' : 'text-gray-900'}">${escapeHtml(job.title)}</span>
+                        ${taobaoHint}
+                    </span>
+                    ${job.job_type === 'custom' ? `<button type="button" class="btn-delete-job text-xs text-red-500 hover:text-red-700" data-job-id="${job.id}">Del</button>` : ''}
+                </label>
+            `;
+        }).join('');
+
+        jobList.querySelectorAll('.job-checkbox').forEach((cb) => {
+            cb.addEventListener('change', () => toggleJob(parseInt(cb.dataset.jobId, 10), cb.checked));
+        });
+        jobList.querySelectorAll('.btn-delete-job').forEach((btn) => {
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                deleteJob(parseInt(btn.dataset.jobId, 10));
+            });
+        });
+    }
+
+    async function toggleJob(jobId, done) {
+        try {
+            const res = await fetch(`/api/jobs/${jobId}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ status: done ? 'done' : 'pending' }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.message || 'Update failed');
+            const idx = deviceJobs.findIndex((j) => j.id === jobId);
+            if (idx >= 0) deviceJobs[idx] = data.job;
+            await refreshInventoryCounts();
+            renderJobPanel();
+            renderTable();
+        } catch (err) {
+            alert(err.message || 'Failed to update job');
+            loadJobsForDevice(selectedDeviceId);
+        }
+    }
+
+    async function deleteJob(jobId) {
+        if (!confirm('Delete this custom job?')) return;
+        try {
+            const res = await fetch(`/api/jobs/${jobId}`, { method: 'DELETE' });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.message || 'Delete failed');
+            deviceJobs = deviceJobs.filter((j) => j.id !== jobId);
+            await refreshInventoryCounts();
+            renderJobPanel();
+            renderTable();
+        } catch (err) {
+            alert(err.message || 'Failed to delete job');
+        }
+    }
+
+    async function addCustomJob() {
+        const title = customJobInput.value.trim();
+        if (!title || !selectedDeviceId) return;
+        try {
+            const res = await fetch(`/api/inventory/${selectedDeviceId}/jobs`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ title }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.message || 'Add failed');
+            deviceJobs.push(data.job);
+            customJobInput.value = '';
+            await refreshInventoryCounts();
+            renderJobPanel();
+            renderTable();
+        } catch (err) {
+            alert(err.message || 'Failed to add job');
+        }
+    }
+
+    async function refreshInventoryCounts() {
+        const res = await fetch('/api/inventory');
+        inventoryData = await res.json();
+        renderPartsSummary();
     }
 
     function renderTable() {
@@ -139,12 +343,12 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         if (inventoryData.length === 0) {
-            tableBody.innerHTML = `<tr><td colspan="6" class="px-6 py-4 text-center text-sm text-gray-500">No devices in inventory yet.</td></tr>`;
+            tableBody.innerHTML = `<tr><td colspan="7" class="px-6 py-4 text-center text-sm text-gray-500">No devices in inventory yet.</td></tr>`;
             return;
         }
 
         if (items.length === 0) {
-            tableBody.innerHTML = `<tr><td colspan="6" class="px-6 py-4 text-center text-sm text-gray-500">No devices match "${escapeHtml(query)}".</td></tr>`;
+            tableBody.innerHTML = `<tr><td colspan="7" class="px-6 py-4 text-center text-sm text-gray-500">No devices match "${escapeHtml(query)}".</td></tr>`;
             return;
         }
 
@@ -153,13 +357,23 @@ document.addEventListener('DOMContentLoaded', () => {
             const parts = parseParts(item.parts_needed);
             const partsStr = blocked
                 ? 'Excluded'
-                : (parts.length > 0 ? parts.join(', ') : 'None');
-            const rowClass = blocked
-                ? 'table-row-hover bg-red-50'
-                : 'table-row-hover';
+                : (parts.length > 0 ? parts.map((p) => p.name).join(', ') : 'None');
+            const selected = item.id === selectedDeviceId;
+            const pending = item.pending_jobs || 0;
+            const total = item.total_jobs || 0;
+            const rowClass = [
+                'table-row-hover',
+                blocked ? 'bg-red-50' : '',
+                selected ? 'table-row-selected' : '',
+            ].filter(Boolean).join(' ');
             const lockClass = blocked
                 ? 'bg-red-100 text-red-800'
                 : 'bg-green-100 text-green-800';
+            const jobBadge = total === 0
+                ? '<span class="text-xs text-gray-400">—</span>'
+                : pending > 0
+                    ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-amber-100 text-amber-800">${pending} left</span>`
+                    : `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-green-100 text-green-800">Done</span>`;
 
             return `
                 <tr class="${rowClass}" data-id="${item.id}">
@@ -174,6 +388,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         S/N: ${escapeHtml(item.serial_number || 'N/A')}<br>
                         IMEI: ${escapeHtml(item.imei || 'N/A')}
                     </td>
+                    <td class="px-6 py-4 whitespace-nowrap">${jobBadge}</td>
                     <td class="px-6 py-4 whitespace-nowrap">
                         <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${lockClass}">
                             ${escapeHtml(item.lock_status || 'Unknown')}
@@ -194,6 +409,10 @@ document.addEventListener('DOMContentLoaded', () => {
         document.querySelectorAll('.table-row-hover').forEach((row) => {
             row.addEventListener('click', () => {
                 const id = parseInt(row.getAttribute('data-id'), 10);
+                selectDevice(id);
+            });
+            row.addEventListener('dblclick', () => {
+                const id = parseInt(row.getAttribute('data-id'), 10);
                 const item = inventoryData.find((i) => i.id === id);
                 if (item) openModal(item);
             });
@@ -208,7 +427,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const parts = parseParts(item.parts_needed);
             const deviceLabel = `#${item.id} ${item.model || 'Unknown'}`.trim();
             parts.forEach((part) => {
-                const key = part.trim();
+                const key = part.name.trim();
                 if (!key) return;
                 if (!aggregates.has(key)) {
                     aggregates.set(key, { part: key, qty: 0, devices: [] });
@@ -274,15 +493,6 @@ document.addEventListener('DOMContentLoaded', () => {
         select.classList.toggle('font-semibold', blocked);
     }
 
-    function parseParts(raw) {
-        try {
-            const parsed = JSON.parse(raw || '[]');
-            return Array.isArray(parsed) ? parsed.map(String) : [];
-        } catch (e) {
-            return [];
-        }
-    }
-
     function renderPartsEditor() {
         elements.partsCount.textContent = `${currentParts.length} part${currentParts.length === 1 ? '' : 's'}`;
 
@@ -294,15 +504,22 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        elements.partsGrid.innerHTML = currentParts.map((part, index) => `
-            <div class="flex items-center gap-2 bg-gray-50 border border-gray-200 rounded-lg px-2 py-1.5" data-index="${index}">
-                <input type="text" value="${escapeAttr(part)}" data-index="${index}"
-                    class="part-name-input flex-1 min-w-0 bg-transparent text-sm text-gray-800 border-0 focus:ring-0 focus:outline-none px-1">
-                <button type="button" data-index="${index}" class="btn-remove-part text-red-500 hover:text-red-700 text-sm font-bold px-2 py-1" title="Remove">
-                    ×
-                </button>
-            </div>
-        `).join('');
+        elements.partsGrid.innerHTML = currentParts.map((part, index) => {
+            const showProgram = SCREEN_PARTS.has(part.name);
+            return `
+            <div class="flex flex-col gap-1 bg-gray-50 border border-gray-200 rounded-lg px-2 py-2" data-index="${index}">
+                <div class="flex items-center gap-2">
+                    <input type="text" value="${escapeAttr(part.name)}" data-index="${index}"
+                        class="part-name-input flex-1 min-w-0 bg-transparent text-sm text-gray-800 border-0 focus:ring-0 focus:outline-none px-1">
+                    <button type="button" data-index="${index}" class="btn-remove-part text-red-500 hover:text-red-700 text-sm font-bold px-2 py-1" title="Remove">×</button>
+                </div>
+                ${showProgram ? `
+                <label class="flex items-center gap-2 text-xs text-gray-600 pl-1">
+                    <input type="checkbox" class="part-program-input rounded border-gray-300 text-blue-600" data-index="${index}" ${part.needs_programming ? 'checked' : ''}>
+                    Needs programming (True Tone / display config)
+                </label>` : ''}
+            </div>`;
+        }).join('');
 
         elements.partsGrid.querySelectorAll('.part-name-input').forEach((input) => {
             input.addEventListener('change', (e) => {
@@ -311,9 +528,16 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (!value) {
                     currentParts.splice(idx, 1);
                 } else {
-                    currentParts[idx] = value;
+                    currentParts[idx] = { ...currentParts[idx], name: value };
                 }
                 renderPartsEditor();
+            });
+        });
+
+        elements.partsGrid.querySelectorAll('.part-program-input').forEach((input) => {
+            input.addEventListener('change', (e) => {
+                const idx = parseInt(e.target.dataset.index, 10);
+                currentParts[idx] = { ...currentParts[idx], needs_programming: e.target.checked };
             });
         });
 
@@ -329,9 +553,9 @@ document.addEventListener('DOMContentLoaded', () => {
     function addPart(name) {
         const cleaned = (name || '').trim();
         if (!cleaned) return;
-        const exists = currentParts.some((p) => p.toLowerCase() === cleaned.toLowerCase());
+        const exists = currentParts.some((p) => p.name.toLowerCase() === cleaned.toLowerCase());
         if (exists) return;
-        currentParts.push(cleaned);
+        currentParts.push({ name: cleaned, needs_programming: false });
         renderPartsEditor();
     }
 
@@ -399,10 +623,16 @@ document.addEventListener('DOMContentLoaded', () => {
         elements.partsGrid.querySelectorAll('.part-name-input').forEach((input) => {
             const idx = parseInt(input.dataset.index, 10);
             if (!Number.isNaN(idx) && currentParts[idx] !== undefined) {
-                currentParts[idx] = input.value.trim();
+                currentParts[idx] = { ...currentParts[idx], name: input.value.trim() };
             }
         });
-        currentParts = currentParts.filter(Boolean);
+        elements.partsGrid.querySelectorAll('.part-program-input').forEach((input) => {
+            const idx = parseInt(input.dataset.index, 10);
+            if (!Number.isNaN(idx) && currentParts[idx] !== undefined) {
+                currentParts[idx] = { ...currentParts[idx], needs_programming: input.checked };
+            }
+        });
+        currentParts = currentParts.filter((p) => p.name);
 
         elements.btnSave.disabled = true;
         elements.btnSave.textContent = 'Saving...';
@@ -435,6 +665,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
             const idx = inventoryData.findIndex((i) => i.id === currentItemId);
             if (idx >= 0) inventoryData[idx] = result.item;
+            if (selectedDeviceId === currentItemId) {
+                await loadJobsForDevice(currentItemId);
+            }
             elements.title.innerText = result.item.model || `Device #${currentItemId}`;
             renderTable();
             renderPartsSummary();
@@ -467,6 +700,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 throw new Error(result.message || 'Delete failed');
             }
             inventoryData = inventoryData.filter((i) => i.id !== currentItemId);
+            if (selectedDeviceId === currentItemId) {
+                selectedDeviceId = null;
+                deviceJobs = [];
+                renderJobPanel();
+            }
             renderTable();
             renderPartsSummary();
             closeModal();
@@ -514,6 +752,58 @@ document.addEventListener('DOMContentLoaded', () => {
     tabInventory.addEventListener('click', () => setActiveTab('inventory'));
     tabParts.addEventListener('click', () => setActiveTab('parts'));
     searchInput.addEventListener('input', renderTable);
+    sortSelect.addEventListener('change', renderTable);
+    btnOpenDevice.addEventListener('click', () => {
+        const item = inventoryData.find((i) => i.id === selectedDeviceId);
+        if (item) openModal(item);
+    });
+    btnAddJob.addEventListener('click', addCustomJob);
+    customJobInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); addCustomJob(); }
+    });
+
+    document.getElementById('btn-taobao-import').addEventListener('click', () => {
+        taobaoModal.classList.remove('hidden');
+        document.getElementById('taobao-results').classList.add('hidden');
+    });
+    document.getElementById('btn-taobao-close').addEventListener('click', () => taobaoModal.classList.add('hidden'));
+    document.getElementById('taobao-overlay').addEventListener('click', () => taobaoModal.classList.add('hidden'));
+    document.getElementById('btn-taobao-upload').addEventListener('click', async () => {
+        const fileInput = document.getElementById('taobao-file');
+        const resultsEl = document.getElementById('taobao-results');
+        if (!fileInput.files || !fileInput.files[0]) {
+            alert('Choose an .xlsx file first');
+            return;
+        }
+        const form = new FormData();
+        form.append('file', fileInput.files[0]);
+        const btn = document.getElementById('btn-taobao-upload');
+        btn.disabled = true;
+        btn.textContent = 'Importing…';
+        try {
+            const res = await fetch('/api/taobao/import', { method: 'POST', body: form });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.message || 'Import failed');
+            await loadInventory();
+            if (selectedDeviceId) await loadJobsForDevice(selectedDeviceId);
+            resultsEl.classList.remove('hidden');
+            const lines = (data.results || []).map((r) => {
+                if (r.status === 'matched') {
+                    const jobs = (r.matched_jobs || []).map((m) => `#${m.inventory_id} ${m.part_name}`).join(', ');
+                    return `✅ ${escapeHtml(r.product_name.slice(0, 40))}… → ${jobs}`;
+                }
+                if (r.status === 'skipped_duplicate') return `⏭ ${escapeHtml(r.order_id)} (already imported)`;
+                return `❌ ${escapeHtml(r.product_name.slice(0, 40))}… — no match (${escapeHtml(r.inferred_part || 'unknown part')})`;
+            });
+            resultsEl.innerHTML = `<p class="font-semibold mb-2">Matched ${data.matched_count} of ${data.total_rows} rows</p>${lines.map((l) => `<div class="py-1 border-b border-gray-200 last:border-0">${l}</div>`).join('')}`;
+        } catch (err) {
+            alert(err.message || 'Import failed');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Upload & Match';
+        }
+    });
+
     elements.lockStatus.addEventListener('change', () => styleLockSelect(elements.lockStatus));
     elements.model.addEventListener('input', () => {
         elements.title.innerText = elements.model.value.trim() || `Device #${currentItemId}`;

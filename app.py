@@ -12,6 +12,9 @@ from database import init_db
 from vision import analyze_photos
 from repair_parts import determine_parts_needed as map_parts_needed
 from ocr_label import extract_label_fields, parse_comma_payload
+from parts_format import parse_parts, serialize_parts
+from repair_jobs import sync_repair_jobs, fetch_jobs_for_inventory, fetch_job_counts
+from taobao_import import apply_taobao_import
 
 app = Flask(__name__, static_folder='static')
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max upload
@@ -23,10 +26,23 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 # Initialize database on startup
 init_db()
 
+
 def get_db_connection():
-    conn = sqlite3.connect('inventory.db')
+    conn = sqlite3.connect('inventory.db', timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _sync_all_repair_jobs():
+    conn = get_db_connection()
+    rows = conn.execute("SELECT id, parts_needed FROM inventory").fetchall()
+    for row in rows:
+        sync_repair_jobs(conn, row["id"], row["parts_needed"])
+    conn.commit()
+    conn.close()
+
+
+_sync_all_repair_jobs()
 
 def analyze_damage_vision_api(front_image_path, back_image_path):
     """Run the device-vision classifiers on saved front/back photos."""
@@ -190,8 +206,16 @@ def serve_uploads(filename):
 def get_inventory():
     conn = get_db_connection()
     inventory = conn.execute('SELECT * FROM inventory ORDER BY id DESC').fetchall()
+    job_counts = fetch_job_counts(conn)
     conn.close()
-    return jsonify([dict(ix) for ix in inventory])
+    items = []
+    for ix in inventory:
+        item = dict(ix)
+        counts = job_counts.get(item["id"], {"pending": 0, "total": 0})
+        item["pending_jobs"] = counts["pending"]
+        item["total_jobs"] = counts["total"]
+        items.append(item)
+    return jsonify(items)
 
 @app.route('/api/scan', methods=['POST'])
 def scan_photos():
@@ -263,6 +287,7 @@ def add_inventory():
     parts_needed = determine_parts_needed(
         damage_condition, remarks, battery_health, model=model
     )
+    parts_json = serialize_parts([{"name": p, "needs_programming": False} for p in parts_needed])
     
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -276,12 +301,14 @@ def add_inventory():
     ''', (
         date_received, model, color, capacity, serial_number,
         ios_version, imei, battery_health, remarks,
-        front_image_url, back_image_url, damage_condition, json.dumps(parts_needed),
+        front_image_url, back_image_url, damage_condition, parts_json,
         vision_device_type, lock_status, inventory_number
     ))
     
     conn.commit()
     new_id = cursor.lastrowid
+    sync_repair_jobs(conn, new_id, parts_json)
+    conn.commit()
     conn.close()
     
     return jsonify({
@@ -309,9 +336,9 @@ def update_inventory(item_id):
         if not isinstance(parts, list):
             conn.close()
             return jsonify({'success': False, 'message': 'parts_needed must be a list'}), 400
-        cleaned = [str(p).strip() for p in parts if str(p).strip()]
+        parts_json = serialize_parts(parts)
         fields.append('parts_needed = ?')
-        values.append(json.dumps(cleaned))
+        values.append(parts_json)
 
     if 'remarks' in data:
         fields.append('remarks = ?')
@@ -351,10 +378,16 @@ def update_inventory(item_id):
 
     values.append(item_id)
     conn.execute(f"UPDATE inventory SET {', '.join(fields)} WHERE id = ?", values)
+    if 'parts_needed' in data:
+        sync_repair_jobs(conn, item_id, parts_json)
     conn.commit()
     updated = conn.execute('SELECT * FROM inventory WHERE id = ?', (item_id,)).fetchone()
+    row_dict = dict(updated)
+    counts = fetch_job_counts(conn).get(item_id, {"pending": 0, "total": 0})
+    row_dict["pending_jobs"] = counts["pending"]
+    row_dict["total_jobs"] = counts["total"]
     conn.close()
-    return jsonify({'success': True, 'item': dict(updated)})
+    return jsonify({'success': True, 'item': row_dict})
 
 
 def _delete_upload_file(image_url):
@@ -380,6 +413,7 @@ def delete_inventory(item_id):
         return jsonify({'success': False, 'message': 'Item not found'}), 404
 
     item = dict(row)
+    conn.execute('DELETE FROM repair_jobs WHERE inventory_id = ?', (item_id,))
     conn.execute('DELETE FROM inventory WHERE id = ?', (item_id,))
     conn.commit()
     conn.close()
@@ -388,6 +422,132 @@ def delete_inventory(item_id):
     _delete_upload_file(item.get('back_image_url'))
 
     return jsonify({'success': True, 'message': 'Device deleted'})
+
+
+@app.route('/api/inventory/<int:item_id>/jobs', methods=['GET'])
+def get_inventory_jobs(item_id):
+    conn = get_db_connection()
+    row = conn.execute('SELECT id FROM inventory WHERE id = ?', (item_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Item not found'}), 404
+    jobs = fetch_jobs_for_inventory(conn, item_id)
+    conn.close()
+    return jsonify({'success': True, 'jobs': jobs})
+
+
+@app.route('/api/inventory/<int:item_id>/jobs', methods=['POST'])
+def add_custom_job(item_id):
+    data = request.json or {}
+    title = (data.get('title') or '').strip()
+    if not title:
+        return jsonify({'success': False, 'message': 'title is required'}), 400
+
+    conn = get_db_connection()
+    row = conn.execute('SELECT id FROM inventory WHERE id = ?', (item_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Item not found'}), 404
+
+    max_sort = conn.execute(
+        'SELECT COALESCE(MAX(sort_order), 0) AS m FROM repair_jobs WHERE inventory_id = ?',
+        (item_id,),
+    ).fetchone()['m']
+
+    cursor = conn.cursor()
+    cursor.execute(
+        '''
+        INSERT INTO repair_jobs (inventory_id, job_type, part_name, title, status, sort_order)
+        VALUES (?, 'custom', NULL, ?, 'pending', ?)
+        ''',
+        (item_id, title, max_sort + 1),
+    )
+    conn.commit()
+    job = dict(conn.execute('SELECT * FROM repair_jobs WHERE id = ?', (cursor.lastrowid,)).fetchone())
+    conn.close()
+    return jsonify({'success': True, 'job': job}), 201
+
+
+@app.route('/api/jobs/<int:job_id>', methods=['PATCH'])
+def update_job(job_id):
+    data = request.json or {}
+    conn = get_db_connection()
+    row = conn.execute('SELECT * FROM repair_jobs WHERE id = ?', (job_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Job not found'}), 404
+
+    fields = []
+    values = []
+    if 'status' in data:
+        status = data['status']
+        if status not in ('pending', 'done'):
+            conn.close()
+            return jsonify({'success': False, 'message': 'status must be pending or done'}), 400
+        fields.append('status = ?')
+        values.append(status)
+        if status == 'done':
+            fields.append("completed_at = datetime('now')")
+        else:
+            fields.append('completed_at = NULL')
+            fields.append('taobao_order_id = NULL')
+            fields.append('taobao_product_name = NULL')
+
+    if 'title' in data and row['job_type'] == 'custom':
+        title = (data.get('title') or '').strip()
+        if title:
+            fields.append('title = ?')
+            values.append(title)
+
+    if not fields:
+        conn.close()
+        return jsonify({'success': False, 'message': 'No updatable fields'}), 400
+
+    values.append(job_id)
+    conn.execute(f"UPDATE repair_jobs SET {', '.join(fields)} WHERE id = ?", values)
+    conn.commit()
+    job = dict(conn.execute('SELECT * FROM repair_jobs WHERE id = ?', (job_id,)).fetchone())
+    conn.close()
+    return jsonify({'success': True, 'job': job})
+
+
+@app.route('/api/jobs/<int:job_id>', methods=['DELETE'])
+def delete_job(job_id):
+    conn = get_db_connection()
+    row = conn.execute('SELECT * FROM repair_jobs WHERE id = ?', (job_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Job not found'}), 404
+    if row['job_type'] != 'custom':
+        conn.close()
+        return jsonify({'success': False, 'message': 'Only custom jobs can be deleted'}), 400
+    conn.execute('DELETE FROM repair_jobs WHERE id = ?', (job_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
+
+@app.route('/api/taobao/import', methods=['POST'])
+def import_taobao():
+    if 'file' not in request.files:
+        return jsonify({'success': False, 'message': 'file is required'}), 400
+    upload = request.files['file']
+    if not upload.filename:
+        return jsonify({'success': False, 'message': 'Empty filename'}), 400
+    if not upload.filename.lower().endswith(('.xlsx', '.xlsm')):
+        return jsonify({'success': False, 'message': 'Upload a .xlsx Taobao export'}), 400
+
+    try:
+        conn = get_db_connection()
+        result = apply_taobao_import(conn, upload.read())
+        conn.close()
+    except ValueError as exc:
+        return jsonify({'success': False, 'message': str(exc)}), 400
+    except Exception as exc:
+        print(f"[taobao] import error: {exc}")
+        return jsonify({'success': False, 'message': 'Failed to parse spreadsheet'}), 500
+
+    return jsonify({'success': True, **result})
 
 
 if __name__ == '__main__':
