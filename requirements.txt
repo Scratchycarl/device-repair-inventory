@@ -3,3 +3,4 @@ flask-cors
 pillow
 pyzbar
 rapidocr-onnxruntime
+openpyxl

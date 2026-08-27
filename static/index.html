@@ -16,6 +16,10 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         .table-row-hover:hover { background-color: #f3f4f6; cursor: pointer; }
+        .table-row-selected { background-color: #eff6ff !important; outline: 2px solid #3b82f6; outline-offset: -2px; }
+        .job-done { text-decoration: line-through; color: #9ca3af; }
+        .ship-step-done { text-decoration: line-through; color: #6b7280; }
+        .ship-step-current { font-weight: 600; color: #1d4ed8; }
     </style>
 </head>
 <body class="bg-gray-100 font-sans text-gray-800">
@@ -26,7 +30,16 @@
                 <div class="flex-shrink-0 flex items-center">
                     <h1 class="text-xl font-bold">Repair Inventory Dashboard</h1>
                 </div>
-                <div>
+                <div class="flex items-center gap-2">
+                    <button type="button" id="btn-settings" class="bg-blue-700 hover:bg-blue-600 px-4 py-2 rounded text-sm font-medium transition">
+                        Settings
+                    </button>
+                    <button type="button" id="btn-warehouse-shipments" class="bg-indigo-600 hover:bg-indigo-500 px-4 py-2 rounded text-sm font-medium transition">
+                        Warehouse Shipments
+                    </button>
+                    <button type="button" id="btn-taobao-import" class="bg-emerald-600 hover:bg-emerald-500 px-4 py-2 rounded text-sm font-medium transition">
+                        Import Taobao
+                    </button>
                     <a href="/scanner.html" class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded text-sm font-medium transition">
                         Open Scanner
                     </a>
@@ -48,15 +61,24 @@
             </nav>
         </div>
 
-        <div id="panel-inventory" class="bg-white shadow rounded-lg overflow-hidden">
+        <div id="panel-inventory" class="flex flex-col xl:flex-row gap-6">
+            <div class="flex-1 min-w-0 bg-white shadow rounded-lg overflow-hidden">
             <div class="px-4 py-5 border-b border-gray-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                 <div>
                     <h3 class="text-lg leading-6 font-medium text-gray-900">Inventory Items</h3>
                     <p id="inventory-search-status" class="text-sm text-gray-500 mt-1 hidden"></p>
                 </div>
-                <input type="search" id="inventory-search" placeholder="Search serial, model, or IMEI"
-                    class="w-full sm:w-80 border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-900 bg-white focus:ring-blue-500 focus:border-blue-500"
-                    autocomplete="off">
+                <div class="flex flex-col sm:flex-row gap-2 sm:items-center">
+                    <select id="inventory-sort" class="border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-900 bg-white focus:ring-blue-500 focus:border-blue-500">
+                        <option value="needs_repair">Sort: Needs repair first</option>
+                        <option value="date_desc">Sort: Newest first</option>
+                        <option value="date_asc">Sort: Oldest first</option>
+                        <option value="model">Sort: Model A–Z</option>
+                    </select>
+                    <input type="search" id="inventory-search" placeholder="Search serial, model, or IMEI"
+                        class="w-full sm:w-64 border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-900 bg-white focus:ring-blue-500 focus:border-blue-500"
+                        autocomplete="off">
+                </div>
             </div>
             
             <div class="overflow-x-auto">
@@ -66,6 +88,7 @@
                             <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ID / Date</th>
                             <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Model</th>
                             <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Serial / IMEI</th>
+                            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Jobs</th>
                             <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Lock</th>
                             <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Condition</th>
                             <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Parts Needed</th>
@@ -73,11 +96,30 @@
                     </thead>
                     <tbody class="bg-white divide-y divide-gray-200" id="inventory-body">
                         <tr>
-                            <td colspan="6" class="px-6 py-4 text-center text-sm text-gray-500">Loading inventory...</td>
+                            <td colspan="7" class="px-6 py-4 text-center text-sm text-gray-500">Loading inventory...</td>
                         </tr>
                     </tbody>
                 </table>
             </div>
+            </div>
+
+            <!-- Per-device job checklist -->
+            <aside id="job-panel" class="xl:w-96 shrink-0 bg-white shadow rounded-lg overflow-hidden flex flex-col max-h-[calc(100vh-12rem)]">
+                <div class="px-4 py-4 border-b border-gray-200 bg-gray-50">
+                    <h3 class="text-lg font-semibold text-gray-900">Repair Jobs</h3>
+                    <p id="job-panel-subtitle" class="text-sm text-gray-500 mt-1">Select a device to view its checklist.</p>
+                    <button type="button" id="btn-open-device" class="hidden mt-2 text-sm text-blue-700 hover:text-blue-900 font-medium">Edit device details →</button>
+                </div>
+                <div id="job-list" class="flex-1 overflow-y-auto p-4 space-y-2">
+                    <p class="text-sm text-gray-400 italic">No device selected.</p>
+                </div>
+                <div id="job-panel-footer" class="hidden border-t border-gray-200 p-4 space-y-2 bg-gray-50">
+                    <div class="flex gap-2">
+                        <input type="text" id="custom-job-input" placeholder="Add custom job…" class="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm">
+                        <button type="button" id="btn-add-job" class="bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium px-3 py-2 rounded-lg">Add</button>
+                    </div>
+                </div>
+            </aside>
         </div>
 
         <div id="panel-parts" class="hidden bg-white shadow rounded-lg overflow-hidden">
@@ -249,6 +291,119 @@
         </div>
     </div>
 
-    <script src="/static/js/dashboard.js?v=19"></script>
+    <!-- Taobao import modal -->
+    <div id="taobao-modal" class="hidden fixed inset-0 z-20 overflow-y-auto">
+        <div class="flex items-center justify-center min-h-screen px-4">
+            <div class="fixed inset-0 bg-gray-500 bg-opacity-75" id="taobao-overlay"></div>
+            <div class="relative bg-white rounded-lg shadow-xl max-w-2xl w-full p-6">
+                <h3 class="text-lg font-bold text-gray-900 mb-2">Import Taobao Orders</h3>
+                <p class="text-sm text-gray-500 mb-4">Part type comes from 商品名称 (e.g. 电池). Device model comes from 型号款式 (e.g. 14, 15 pro max). Upload uses rules only. If rows still look wrong, click Retry unmatched with LLM.</p>
+                <input type="file" id="taobao-file" accept=".xlsx,.xlsm" class="block w-full text-sm text-gray-600 mb-4">
+                <div id="taobao-results" class="hidden max-h-64 overflow-y-auto text-sm border rounded-lg p-3 bg-gray-50 mb-4"></div>
+                <div class="flex justify-end gap-2">
+                    <button type="button" id="btn-taobao-close" class="px-4 py-2 text-sm border rounded-lg hover:bg-gray-50">Close</button>
+                    <button type="button" id="btn-taobao-llm" class="px-4 py-2 text-sm bg-violet-600 text-white rounded-lg hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed" disabled>Retry unmatched with LLM</button>
+                    <button type="button" id="btn-taobao-upload" class="px-4 py-2 text-sm bg-emerald-600 text-white rounded-lg hover:bg-emerald-700">Upload &amp; Match</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Part order shipping detail -->
+    <div id="shipping-modal" class="hidden fixed inset-0 z-30 overflow-y-auto">
+        <div class="flex items-center justify-center min-h-screen px-4 py-8">
+            <div class="fixed inset-0 bg-gray-500 bg-opacity-75" id="shipping-overlay"></div>
+            <div class="relative bg-white rounded-lg shadow-xl max-w-lg w-full p-6 max-h-[90vh] overflow-y-auto">
+                <div class="flex justify-between items-start mb-4">
+                    <div>
+                        <h3 class="text-lg font-bold text-gray-900" id="shipping-modal-title">Order shipping</h3>
+                        <p class="text-sm text-gray-500" id="shipping-modal-subtitle"></p>
+                    </div>
+                    <button type="button" id="btn-shipping-close" class="text-gray-400 hover:text-gray-600 text-xl leading-none">&times;</button>
+                </div>
+                <ol id="shipping-steps" class="space-y-4 mb-4"></ol>
+                <div id="shipping-tracking-panel" class="hidden border rounded-lg p-3 bg-gray-50 text-sm mb-4"></div>
+                <div class="flex flex-wrap gap-2 justify-end">
+                    <button type="button" id="btn-shipping-refresh" class="px-3 py-2 text-sm border rounded-lg hover:bg-gray-50">Refresh carrier updates</button>
+                    <select id="shipping-stage-select" class="border rounded-lg px-3 py-2 text-sm">
+                        <option value="ordered">Ordered</option>
+                        <option value="transit_warehouse">In transit to warehouse</option>
+                        <option value="in_warehouse">In warehouse</option>
+                        <option value="transit_to_you">In transit to you</option>
+                        <option value="delivered">Delivered</option>
+                    </select>
+                    <button type="button" id="btn-shipping-save-stage" class="px-3 py-2 text-sm bg-blue-600 text-white rounded-lg">Update stage</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Warehouse outbound shipments -->
+    <div id="warehouse-modal" class="hidden fixed inset-0 z-20 overflow-y-auto">
+        <div class="flex items-center justify-center min-h-screen px-4 py-8">
+            <div class="fixed inset-0 bg-gray-500 bg-opacity-75" id="warehouse-overlay"></div>
+            <div class="relative bg-white rounded-lg shadow-xl max-w-3xl w-full p-6 max-h-[90vh] overflow-y-auto">
+                <h3 class="text-lg font-bold text-gray-900 mb-1">Warehouse → You shipments</h3>
+                <p class="text-sm text-gray-500 mb-4">Create a shipment with a tracking number and assign parts you've already ordered.</p>
+
+                <div class="border rounded-lg p-4 mb-6 bg-gray-50">
+                    <h4 class="text-sm font-semibold mb-2">New shipment</h4>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-3">
+                        <input type="text" id="wh-tracking" placeholder="Tracking number" class="border rounded-lg px-3 py-2 text-sm">
+                        <input type="text" id="wh-carrier" placeholder="Carrier (optional)" class="border rounded-lg px-3 py-2 text-sm">
+                    </div>
+                    <input type="text" id="wh-notes" placeholder="Notes (optional)" class="border rounded-lg px-3 py-2 text-sm w-full mb-3">
+                    <p class="text-xs font-semibold text-gray-500 uppercase mb-2">Assign ordered parts</p>
+                    <div id="wh-assignable-list" class="max-h-40 overflow-y-auto border rounded-lg bg-white p-2 text-sm space-y-1 mb-3"></div>
+                    <button type="button" id="btn-wh-create" class="px-4 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700">Create shipment</button>
+                </div>
+
+                <h4 class="text-sm font-semibold mb-2">Existing shipments</h4>
+                <div id="wh-shipment-list" class="space-y-2 text-sm"></div>
+                <div class="flex justify-end mt-4">
+                    <button type="button" id="btn-warehouse-close" class="px-4 py-2 text-sm border rounded-lg hover:bg-gray-50">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings -->
+    <div id="settings-modal" class="hidden fixed inset-0 z-40 overflow-y-auto">
+        <div class="flex items-center justify-center min-h-screen px-4 py-8">
+            <div class="fixed inset-0 bg-gray-500 bg-opacity-75" id="settings-overlay"></div>
+            <div class="relative bg-white rounded-lg shadow-xl max-w-lg w-full p-6">
+                <h3 class="text-lg font-bold text-gray-900 mb-1">Settings</h3>
+                <p class="text-sm text-gray-500 mb-4">OpenAI-compatible Chat Completions. Import still uses rules first; LLM only runs when you click Retry unmatched with LLM.</p>
+
+                <label class="flex items-start gap-2 mb-4 cursor-pointer">
+                    <input type="checkbox" id="set-llm-enabled" class="mt-1 rounded border-gray-300 text-blue-600">
+                    <span>
+                        <span class="text-sm font-medium text-gray-900">Enable LLM matching</span>
+                        <span class="block text-xs text-gray-500">Must be on to use the Retry unmatched with LLM button. Does not run automatically on upload.</span>
+                    </span>
+                </label>
+
+                <label class="block text-sm font-medium text-gray-700 mb-1">API base URL</label>
+                <input type="url" id="set-llm-url" placeholder="https://api.openai.com/v1" class="w-full border rounded-lg px-3 py-2 text-sm mb-3" autocomplete="off">
+
+                <label class="block text-sm font-medium text-gray-700 mb-1">Model</label>
+                <input type="text" id="set-llm-model" placeholder="gpt-4o-mini" class="w-full border rounded-lg px-3 py-2 text-sm mb-3" autocomplete="off">
+
+                <label class="block text-sm font-medium text-gray-700 mb-1">API key</label>
+                <input type="password" id="set-llm-key" placeholder="sk-…" class="w-full border rounded-lg px-3 py-2 text-sm mb-1" autocomplete="new-password">
+                <p id="set-llm-key-hint" class="text-xs text-gray-400 mb-4 hidden">A key is already saved. Leave blank to keep it.</p>
+
+                <p id="set-llm-status" class="text-sm mb-4 hidden"></p>
+
+                <div class="flex flex-wrap justify-end gap-2">
+                    <button type="button" id="btn-settings-test" class="px-4 py-2 text-sm border rounded-lg hover:bg-gray-50">Test connection</button>
+                    <button type="button" id="btn-settings-close" class="px-4 py-2 text-sm border rounded-lg hover:bg-gray-50">Close</button>
+                    <button type="button" id="btn-settings-save" class="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700">Save</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/dashboard.js?v=25"></script>
 </body>
 </html>

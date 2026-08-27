@@ -7,8 +7,25 @@ document.addEventListener('DOMContentLoaded', () => {
     const tabInventory = document.getElementById('tab-inventory');
     const tabParts = document.getElementById('tab-parts');
     const searchInput = document.getElementById('inventory-search');
+    const sortSelect = document.getElementById('inventory-sort');
     const searchStatus = document.getElementById('inventory-search-status');
     const modal = document.getElementById('detail-modal');
+    const jobList = document.getElementById('job-list');
+    const jobPanelSubtitle = document.getElementById('job-panel-subtitle');
+    const jobPanelFooter = document.getElementById('job-panel-footer');
+    const btnOpenDevice = document.getElementById('btn-open-device');
+    const customJobInput = document.getElementById('custom-job-input');
+    const btnAddJob = document.getElementById('btn-add-job');
+    const taobaoModal = document.getElementById('taobao-modal');
+    const shippingModal = document.getElementById('shipping-modal');
+    const warehouseModal = document.getElementById('warehouse-modal');
+    const settingsModal = document.getElementById('settings-modal');
+
+    let activePartOrderId = null;
+    let lastImportBatchId = null;
+    let lastImportUnmatched = 0;
+
+    const SCREEN_PARTS = new Set(['OLED Assembly', 'LCD Assembly', 'Digitizer', 'Display Assembly']);
 
     const COMMON_PARTS = [
         'OLED Assembly',
@@ -19,6 +36,7 @@ document.addEventListener('DOMContentLoaded', () => {
         'Back Cover',
         'Back Housing',
         'Replacement Battery',
+        'LiDAR Module',
         'Camera Module',
         'Rear Camera Glass',
         'WiFi Antenna',
@@ -66,6 +84,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     let inventoryData = [];
     let currentItemId = null;
+    let selectedDeviceId = null;
+    let deviceJobs = [];
     let currentParts = [];
 
     elements.commonPartsList.innerHTML = COMMON_PARTS
@@ -101,9 +121,16 @@ document.addEventListener('DOMContentLoaded', () => {
             inventoryData = await res.json();
             renderTable();
             renderPartsSummary();
+            if (!selectedDeviceId && inventoryData.length > 0) {
+                const sorted = sortInventoryItems(inventoryData);
+                const needsRepair = sorted.find((i) => (i.pending_jobs || 0) > 0);
+                selectDevice((needsRepair || sorted[0]).id);
+            } else if (selectedDeviceId) {
+                loadJobsForDevice(selectedDeviceId);
+            }
         } catch (error) {
             console.error('Error fetching inventory:', error);
-            tableBody.innerHTML = `<tr><td colspan="6" class="px-6 py-4 text-center text-sm text-red-500">Failed to load inventory.</td></tr>`;
+            tableBody.innerHTML = `<tr><td colspan="7" class="px-6 py-4 text-center text-sm text-red-500">Failed to load inventory.</td></tr>`;
         }
     }
 
@@ -121,8 +148,343 @@ document.addEventListener('DOMContentLoaded', () => {
         return false;
     }
 
+    function parseParts(raw) {
+        try {
+            const parsed = typeof raw === 'string' ? JSON.parse(raw || '[]') : (raw || []);
+            if (!Array.isArray(parsed)) return [];
+            return parsed.map((item) => {
+                if (typeof item === 'string') {
+                    const name = item.trim();
+                    return name ? { name, needs_programming: false } : null;
+                }
+                if (item && typeof item === 'object') {
+                    const name = String(item.name || '').trim();
+                    if (!name) return null;
+                    return { name, needs_programming: Boolean(item.needs_programming) };
+                }
+                return null;
+            }).filter(Boolean);
+        } catch (e) {
+            return [];
+        }
+    }
+
+    function partNamesFromRaw(raw) {
+        return parseParts(raw).map((p) => p.name);
+    }
+
+    function sortInventoryItems(items) {
+        const mode = sortSelect.value || 'needs_repair';
+        const sorted = [...items];
+        sorted.sort((a, b) => {
+            if (mode === 'needs_repair') {
+                const aPending = a.pending_jobs || 0;
+                const bPending = b.pending_jobs || 0;
+                if (aPending > 0 && bPending === 0) return -1;
+                if (bPending > 0 && aPending === 0) return 1;
+                if (bPending !== aPending) return bPending - aPending;
+                return (b.id || 0) - (a.id || 0);
+            }
+            if (mode === 'date_asc') {
+                return String(a.date_received || '').localeCompare(String(b.date_received || '')) || a.id - b.id;
+            }
+            if (mode === 'model') {
+                return String(a.model || '').localeCompare(String(b.model || '')) || a.id - b.id;
+            }
+            // date_desc default
+            return String(b.date_received || '').localeCompare(String(a.date_received || '')) || b.id - a.id;
+        });
+        return sorted;
+    }
+
     function filteredInventory() {
-        return inventoryData.filter((item) => matchesSearch(item, searchInput.value));
+        return sortInventoryItems(inventoryData.filter((item) => matchesSearch(item, searchInput.value)));
+    }
+
+    async function loadJobsForDevice(deviceId) {
+        if (!deviceId) {
+            deviceJobs = [];
+            renderJobPanel();
+            return;
+        }
+        try {
+            const res = await fetch(`/api/inventory/${deviceId}/jobs`);
+            const data = await res.json();
+            deviceJobs = data.jobs || [];
+            renderJobPanel();
+        } catch (err) {
+            console.error('Failed to load jobs', err);
+            jobList.innerHTML = '<p class="text-sm text-red-500">Failed to load jobs.</p>';
+        }
+    }
+
+    function selectDevice(deviceId) {
+        selectedDeviceId = deviceId;
+        renderTable();
+        loadJobsForDevice(deviceId);
+    }
+
+    function renderJobPanel() {
+        const item = inventoryData.find((i) => i.id === selectedDeviceId);
+        if (!item) {
+            jobPanelSubtitle.textContent = 'Select a device to view its checklist.';
+            btnOpenDevice.classList.add('hidden');
+            jobPanelFooter.classList.add('hidden');
+            jobList.innerHTML = '<p class="text-sm text-gray-400 italic">No device selected.</p>';
+            return;
+        }
+
+        const label = item.model || `Device #${item.id}`;
+        const pending = item.pending_jobs || 0;
+        const total = item.total_jobs || 0;
+        jobPanelSubtitle.textContent = `${label} · ${pending} pending / ${total} total`;
+        btnOpenDevice.classList.remove('hidden');
+        jobPanelFooter.classList.remove('hidden');
+
+        if (deviceJobs.length === 0) {
+            jobList.innerHTML = '<p class="text-sm text-gray-400 italic">No jobs yet. Save parts on this device to generate tasks.</p>';
+            return;
+        }
+
+        jobList.innerHTML = deviceJobs.map((job) => {
+            const done = job.status === 'done';
+            const po = job.part_order;
+            const shipBadge = po
+                ? `<span class="inline-block mt-1 text-xs px-2 py-0.5 rounded-full bg-sky-100 text-sky-800">${escapeHtml(po.shipping_label || po.shipping_stage)}</span>`
+                : '';
+            const taobaoHint = po?.taobao_order_id
+                ? `<span class="text-xs text-emerald-600 block mt-0.5">Taobao ${escapeHtml(po.taobao_order_id)}</span>`
+                : (job.taobao_order_id ? `<span class="text-xs text-emerald-600 block mt-0.5">Taobao ${escapeHtml(job.taobao_order_id)}</span>` : '');
+            const trackBtn = po
+                ? `<button type="button" class="btn-track-order text-xs text-blue-700 hover:underline mt-1" data-part-order-id="${po.id}">Shipping details</button>`
+                : '';
+            return `
+                <div class="flex items-start gap-3 p-2 rounded-lg border ${done ? 'border-gray-200 bg-gray-50' : 'border-gray-200 bg-white hover:bg-blue-50'}">
+                    <label class="flex items-start gap-3 flex-1 cursor-pointer min-w-0">
+                        <input type="checkbox" class="job-checkbox mt-1 rounded border-gray-300 text-blue-600 shrink-0" data-job-id="${job.id}" ${done ? 'checked' : ''}>
+                        <span class="flex-1 min-w-0">
+                            <span class="text-sm ${done ? 'job-done' : 'text-gray-900'}">${escapeHtml(job.title)}</span>
+                            ${taobaoHint}
+                            ${shipBadge}
+                            ${trackBtn}
+                        </span>
+                    </label>
+                    ${job.job_type === 'custom' ? `<button type="button" class="btn-delete-job text-xs text-red-500 hover:text-red-700 shrink-0" data-job-id="${job.id}">Del</button>` : ''}
+                </div>
+            `;
+        }).join('');
+
+        jobList.querySelectorAll('.job-checkbox').forEach((cb) => {
+            cb.addEventListener('change', () => toggleJob(parseInt(cb.dataset.jobId, 10), cb.checked));
+        });
+        jobList.querySelectorAll('.btn-track-order').forEach((btn) => {
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                openShippingModal(parseInt(btn.dataset.partOrderId, 10));
+            });
+        });
+        jobList.querySelectorAll('.btn-delete-job').forEach((btn) => {
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                deleteJob(parseInt(btn.dataset.jobId, 10));
+            });
+        });
+    }
+
+    async function toggleJob(jobId, done) {
+        try {
+            const res = await fetch(`/api/jobs/${jobId}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ status: done ? 'done' : 'pending' }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.message || 'Update failed');
+            const idx = deviceJobs.findIndex((j) => j.id === jobId);
+            if (idx >= 0) deviceJobs[idx] = data.job;
+            await refreshInventoryCounts();
+            renderJobPanel();
+            renderTable();
+        } catch (err) {
+            alert(err.message || 'Failed to update job');
+            loadJobsForDevice(selectedDeviceId);
+        }
+    }
+
+    async function deleteJob(jobId) {
+        if (!confirm('Delete this custom job?')) return;
+        try {
+            const res = await fetch(`/api/jobs/${jobId}`, { method: 'DELETE' });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.message || 'Delete failed');
+            deviceJobs = deviceJobs.filter((j) => j.id !== jobId);
+            await refreshInventoryCounts();
+            renderJobPanel();
+            renderTable();
+        } catch (err) {
+            alert(err.message || 'Failed to delete job');
+        }
+    }
+
+    async function addCustomJob() {
+        const title = customJobInput.value.trim();
+        if (!title || !selectedDeviceId) return;
+        try {
+            const res = await fetch(`/api/inventory/${selectedDeviceId}/jobs`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ title }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.message || 'Add failed');
+            deviceJobs.push(data.job);
+            customJobInput.value = '';
+            await refreshInventoryCounts();
+            renderJobPanel();
+            renderTable();
+        } catch (err) {
+            alert(err.message || 'Failed to add job');
+        }
+    }
+
+    async function refreshInventoryCounts() {
+        const res = await fetch('/api/inventory');
+        inventoryData = await res.json();
+        renderPartsSummary();
+    }
+
+    async function openShippingModal(partOrderId) {
+        activePartOrderId = partOrderId;
+        shippingModal.classList.remove('hidden');
+        await renderShippingModal();
+    }
+
+    function closeShippingModal() {
+        shippingModal.classList.add('hidden');
+        activePartOrderId = null;
+    }
+
+    async function renderShippingModal() {
+        if (!activePartOrderId) return;
+        const res = await fetch(`/api/part-orders/${activePartOrderId}`);
+        const data = await res.json();
+        if (!res.ok) {
+            alert(data.message || 'Failed to load shipping');
+            return;
+        }
+        const po = data.part_order;
+        document.getElementById('shipping-modal-title').textContent = po.part_name || 'Part order';
+        document.getElementById('shipping-modal-subtitle').textContent =
+            `#${po.device_id} ${po.device_model || ''} · Taobao ${po.taobao_order_id}`;
+        document.getElementById('shipping-stage-select').value = po.shipping_stage || 'ordered';
+
+        const stepsEl = document.getElementById('shipping-steps');
+        stepsEl.innerHTML = (po.shipping_steps || []).map((step) => {
+            const cls = step.completed ? 'ship-step-done' : (step.current ? 'ship-step-current' : 'text-gray-700');
+            let detail = '';
+            if (step.stage === 'transit_warehouse' && (step.tracking_number || step.carrier)) {
+                detail = `<div class="text-xs text-gray-500 mt-1 ml-6">${escapeHtml(step.carrier || 'Carrier TBD')} · ${escapeHtml(step.tracking_number || 'No tracking yet')}</div>`;
+            }
+            if (step.stage === 'transit_to_you' && step.tracking_number) {
+                detail = `<div class="text-xs text-gray-500 mt-1 ml-6">Warehouse shipment: ${escapeHtml(step.carrier || '')} ${escapeHtml(step.tracking_number)}</div>`;
+            }
+            return `<li class="text-sm ${cls}">${step.completed ? '✓' : (step.current ? '●' : '○')} ${escapeHtml(step.label)}${detail}</li>`;
+        }).join('');
+
+        const trackPanel = document.getElementById('shipping-tracking-panel');
+        const transitStep = (po.shipping_steps || []).find((s) => s.stage === 'transit_warehouse');
+        const events = transitStep?.events || [];
+        if (po.domestic_tracking_number || events.length) {
+            trackPanel.classList.remove('hidden');
+            const eventHtml = events.length
+                ? events.map((ev) => `<div class="py-1 border-b border-gray-200 last:border-0"><span class="text-gray-400">${escapeHtml(ev.time)}</span> ${escapeHtml(ev.context)}</div>`).join('')
+                : '<p class="text-gray-500 italic">No carrier updates yet. Import an updated sheet with tracking or click Refresh.</p>';
+            trackPanel.innerHTML = `<p class="font-semibold mb-2">Domestic carrier updates</p>${eventHtml}`;
+        } else {
+            trackPanel.classList.add('hidden');
+            trackPanel.innerHTML = '';
+        }
+    }
+
+    async function openWarehouseModal() {
+        warehouseModal.classList.remove('hidden');
+        await loadWarehouseModal();
+    }
+
+    function closeWarehouseModal() {
+        warehouseModal.classList.add('hidden');
+    }
+
+    async function loadWarehouseModal() {
+        const [assignRes, shipRes] = await Promise.all([
+            fetch('/api/part-orders/assignable'),
+            fetch('/api/warehouse-shipments'),
+        ]);
+        const assignData = await assignRes.json();
+        const shipData = await shipRes.json();
+        const listEl = document.getElementById('wh-assignable-list');
+        const orders = assignData.part_orders || [];
+        if (!orders.length) {
+            listEl.innerHTML = '<p class="text-gray-400 italic p-2">No unassigned ordered parts.</p>';
+        } else {
+            listEl.innerHTML = orders.map((po) => `
+                <label class="flex items-center gap-2 p-1 hover:bg-gray-50 rounded cursor-pointer">
+                    <input type="checkbox" class="wh-part-cb rounded" value="${po.id}">
+                    <span>#${po.inventory_id} ${escapeHtml(po.device_model || '')} · ${escapeHtml(po.part_name || '')} <span class="text-gray-400">(${escapeHtml(po.shipping_stage)})</span></span>
+                </label>
+            `).join('');
+        }
+        const shipList = document.getElementById('wh-shipment-list');
+        const shipments = shipData.shipments || [];
+        if (!shipments.length) {
+            shipList.innerHTML = '<p class="text-gray-400 italic">No warehouse shipments yet.</p>';
+        } else {
+            shipList.innerHTML = shipments.map((s) => `
+                <div class="border rounded-lg p-3 flex items-start justify-between gap-2">
+                    <div>
+                        <div class="font-medium">${escapeHtml(s.tracking_number)} ${s.carrier ? '· ' + escapeHtml(s.carrier) : ''}</div>
+                        <div class="text-gray-500 text-xs">${s.item_count || 0} part(s) · ${escapeHtml(s.status)}</div>
+                    </div>
+                    ${s.status !== 'delivered' ? `<button type="button" class="btn-wh-delivered shrink-0 text-xs text-indigo-700 hover:underline" data-id="${s.id}">Mark delivered</button>` : ''}
+                </div>
+            `).join('');
+            shipList.querySelectorAll('.btn-wh-delivered').forEach((btn) => {
+                btn.addEventListener('click', () => markWarehouseDelivered(parseInt(btn.dataset.id, 10)));
+            });
+        }
+    }
+
+    async function createWarehouseShipment() {
+        const tracking = document.getElementById('wh-tracking').value.trim();
+        const carrier = document.getElementById('wh-carrier').value.trim();
+        const notes = document.getElementById('wh-notes').value.trim();
+        const ids = [...document.querySelectorAll('.wh-part-cb:checked')].map((cb) => parseInt(cb.value, 10));
+        if (!tracking) { alert('Enter a tracking number'); return; }
+        if (!ids.length) { alert('Select at least one part'); return; }
+        const res = await fetch('/api/warehouse-shipments', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tracking_number: tracking, carrier, notes, part_order_ids: ids }),
+        });
+        const data = await res.json();
+        if (!res.ok) { alert(data.message || 'Failed'); return; }
+        document.getElementById('wh-tracking').value = '';
+        document.getElementById('wh-carrier').value = '';
+        document.getElementById('wh-notes').value = '';
+        await loadWarehouseModal();
+        if (selectedDeviceId) await loadJobsForDevice(selectedDeviceId);
+    }
+
+    async function markWarehouseDelivered(shipmentId) {
+        const res = await fetch(`/api/warehouse-shipments/${shipmentId}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mark_delivered: true }),
+        });
+        const data = await res.json();
+        if (!res.ok) { alert(data.message || 'Failed'); return; }
+        await loadWarehouseModal();
+        if (selectedDeviceId) await loadJobsForDevice(selectedDeviceId);
     }
 
     function renderTable() {
@@ -139,12 +501,12 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         if (inventoryData.length === 0) {
-            tableBody.innerHTML = `<tr><td colspan="6" class="px-6 py-4 text-center text-sm text-gray-500">No devices in inventory yet.</td></tr>`;
+            tableBody.innerHTML = `<tr><td colspan="7" class="px-6 py-4 text-center text-sm text-gray-500">No devices in inventory yet.</td></tr>`;
             return;
         }
 
         if (items.length === 0) {
-            tableBody.innerHTML = `<tr><td colspan="6" class="px-6 py-4 text-center text-sm text-gray-500">No devices match "${escapeHtml(query)}".</td></tr>`;
+            tableBody.innerHTML = `<tr><td colspan="7" class="px-6 py-4 text-center text-sm text-gray-500">No devices match "${escapeHtml(query)}".</td></tr>`;
             return;
         }
 
@@ -153,13 +515,23 @@ document.addEventListener('DOMContentLoaded', () => {
             const parts = parseParts(item.parts_needed);
             const partsStr = blocked
                 ? 'Excluded'
-                : (parts.length > 0 ? parts.join(', ') : 'None');
-            const rowClass = blocked
-                ? 'table-row-hover bg-red-50'
-                : 'table-row-hover';
+                : (parts.length > 0 ? parts.map((p) => p.name).join(', ') : 'None');
+            const selected = item.id === selectedDeviceId;
+            const pending = item.pending_jobs || 0;
+            const total = item.total_jobs || 0;
+            const rowClass = [
+                'table-row-hover',
+                blocked ? 'bg-red-50' : '',
+                selected ? 'table-row-selected' : '',
+            ].filter(Boolean).join(' ');
             const lockClass = blocked
                 ? 'bg-red-100 text-red-800'
                 : 'bg-green-100 text-green-800';
+            const jobBadge = total === 0
+                ? '<span class="text-xs text-gray-400">—</span>'
+                : pending > 0
+                    ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-amber-100 text-amber-800">${pending} left</span>`
+                    : `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold bg-green-100 text-green-800">Done</span>`;
 
             return `
                 <tr class="${rowClass}" data-id="${item.id}">
@@ -174,6 +546,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         S/N: ${escapeHtml(item.serial_number || 'N/A')}<br>
                         IMEI: ${escapeHtml(item.imei || 'N/A')}
                     </td>
+                    <td class="px-6 py-4 whitespace-nowrap">${jobBadge}</td>
                     <td class="px-6 py-4 whitespace-nowrap">
                         <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${lockClass}">
                             ${escapeHtml(item.lock_status || 'Unknown')}
@@ -194,6 +567,10 @@ document.addEventListener('DOMContentLoaded', () => {
         document.querySelectorAll('.table-row-hover').forEach((row) => {
             row.addEventListener('click', () => {
                 const id = parseInt(row.getAttribute('data-id'), 10);
+                selectDevice(id);
+            });
+            row.addEventListener('dblclick', () => {
+                const id = parseInt(row.getAttribute('data-id'), 10);
                 const item = inventoryData.find((i) => i.id === id);
                 if (item) openModal(item);
             });
@@ -208,7 +585,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const parts = parseParts(item.parts_needed);
             const deviceLabel = `#${item.id} ${item.model || 'Unknown'}`.trim();
             parts.forEach((part) => {
-                const key = part.trim();
+                const key = part.name.trim();
                 if (!key) return;
                 if (!aggregates.has(key)) {
                     aggregates.set(key, { part: key, qty: 0, devices: [] });
@@ -274,15 +651,6 @@ document.addEventListener('DOMContentLoaded', () => {
         select.classList.toggle('font-semibold', blocked);
     }
 
-    function parseParts(raw) {
-        try {
-            const parsed = JSON.parse(raw || '[]');
-            return Array.isArray(parsed) ? parsed.map(String) : [];
-        } catch (e) {
-            return [];
-        }
-    }
-
     function renderPartsEditor() {
         elements.partsCount.textContent = `${currentParts.length} part${currentParts.length === 1 ? '' : 's'}`;
 
@@ -294,15 +662,22 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        elements.partsGrid.innerHTML = currentParts.map((part, index) => `
-            <div class="flex items-center gap-2 bg-gray-50 border border-gray-200 rounded-lg px-2 py-1.5" data-index="${index}">
-                <input type="text" value="${escapeAttr(part)}" data-index="${index}"
-                    class="part-name-input flex-1 min-w-0 bg-transparent text-sm text-gray-800 border-0 focus:ring-0 focus:outline-none px-1">
-                <button type="button" data-index="${index}" class="btn-remove-part text-red-500 hover:text-red-700 text-sm font-bold px-2 py-1" title="Remove">
-                    ×
-                </button>
-            </div>
-        `).join('');
+        elements.partsGrid.innerHTML = currentParts.map((part, index) => {
+            const showProgram = SCREEN_PARTS.has(part.name);
+            return `
+            <div class="flex flex-col gap-1 bg-gray-50 border border-gray-200 rounded-lg px-2 py-2" data-index="${index}">
+                <div class="flex items-center gap-2">
+                    <input type="text" value="${escapeAttr(part.name)}" data-index="${index}"
+                        class="part-name-input flex-1 min-w-0 bg-transparent text-sm text-gray-800 border-0 focus:ring-0 focus:outline-none px-1">
+                    <button type="button" data-index="${index}" class="btn-remove-part text-red-500 hover:text-red-700 text-sm font-bold px-2 py-1" title="Remove">×</button>
+                </div>
+                ${showProgram ? `
+                <label class="flex items-center gap-2 text-xs text-gray-600 pl-1">
+                    <input type="checkbox" class="part-program-input rounded border-gray-300 text-blue-600" data-index="${index}" ${part.needs_programming ? 'checked' : ''}>
+                    Needs programming (True Tone / display config)
+                </label>` : ''}
+            </div>`;
+        }).join('');
 
         elements.partsGrid.querySelectorAll('.part-name-input').forEach((input) => {
             input.addEventListener('change', (e) => {
@@ -311,9 +686,16 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (!value) {
                     currentParts.splice(idx, 1);
                 } else {
-                    currentParts[idx] = value;
+                    currentParts[idx] = { ...currentParts[idx], name: value };
                 }
                 renderPartsEditor();
+            });
+        });
+
+        elements.partsGrid.querySelectorAll('.part-program-input').forEach((input) => {
+            input.addEventListener('change', (e) => {
+                const idx = parseInt(e.target.dataset.index, 10);
+                currentParts[idx] = { ...currentParts[idx], needs_programming: e.target.checked };
             });
         });
 
@@ -329,9 +711,9 @@ document.addEventListener('DOMContentLoaded', () => {
     function addPart(name) {
         const cleaned = (name || '').trim();
         if (!cleaned) return;
-        const exists = currentParts.some((p) => p.toLowerCase() === cleaned.toLowerCase());
+        const exists = currentParts.some((p) => p.name.toLowerCase() === cleaned.toLowerCase());
         if (exists) return;
-        currentParts.push(cleaned);
+        currentParts.push({ name: cleaned, needs_programming: false });
         renderPartsEditor();
     }
 
@@ -399,10 +781,16 @@ document.addEventListener('DOMContentLoaded', () => {
         elements.partsGrid.querySelectorAll('.part-name-input').forEach((input) => {
             const idx = parseInt(input.dataset.index, 10);
             if (!Number.isNaN(idx) && currentParts[idx] !== undefined) {
-                currentParts[idx] = input.value.trim();
+                currentParts[idx] = { ...currentParts[idx], name: input.value.trim() };
             }
         });
-        currentParts = currentParts.filter(Boolean);
+        elements.partsGrid.querySelectorAll('.part-program-input').forEach((input) => {
+            const idx = parseInt(input.dataset.index, 10);
+            if (!Number.isNaN(idx) && currentParts[idx] !== undefined) {
+                currentParts[idx] = { ...currentParts[idx], needs_programming: input.checked };
+            }
+        });
+        currentParts = currentParts.filter((p) => p.name);
 
         elements.btnSave.disabled = true;
         elements.btnSave.textContent = 'Saving...';
@@ -435,6 +823,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
             const idx = inventoryData.findIndex((i) => i.id === currentItemId);
             if (idx >= 0) inventoryData[idx] = result.item;
+            if (selectedDeviceId === currentItemId) {
+                await loadJobsForDevice(currentItemId);
+            }
             elements.title.innerText = result.item.model || `Device #${currentItemId}`;
             renderTable();
             renderPartsSummary();
@@ -467,6 +858,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 throw new Error(result.message || 'Delete failed');
             }
             inventoryData = inventoryData.filter((i) => i.id !== currentItemId);
+            if (selectedDeviceId === currentItemId) {
+                selectedDeviceId = null;
+                deviceJobs = [];
+                renderJobPanel();
+            }
             renderTable();
             renderPartsSummary();
             closeModal();
@@ -514,6 +910,224 @@ document.addEventListener('DOMContentLoaded', () => {
     tabInventory.addEventListener('click', () => setActiveTab('inventory'));
     tabParts.addEventListener('click', () => setActiveTab('parts'));
     searchInput.addEventListener('input', renderTable);
+    sortSelect.addEventListener('change', renderTable);
+    btnOpenDevice.addEventListener('click', () => {
+        const item = inventoryData.find((i) => i.id === selectedDeviceId);
+        if (item) openModal(item);
+    });
+    btnAddJob.addEventListener('click', addCustomJob);
+    customJobInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); addCustomJob(); }
+    });
+
+    document.getElementById('btn-taobao-import').addEventListener('click', () => {
+        taobaoModal.classList.remove('hidden');
+        document.getElementById('taobao-results').classList.add('hidden');
+        const llmBtn = document.getElementById('btn-taobao-llm');
+        llmBtn.disabled = true;
+        lastImportBatchId = null;
+        lastImportUnmatched = 0;
+    });
+    document.getElementById('btn-warehouse-shipments').addEventListener('click', openWarehouseModal);
+    document.getElementById('btn-warehouse-close').addEventListener('click', closeWarehouseModal);
+    document.getElementById('warehouse-overlay').addEventListener('click', closeWarehouseModal);
+    document.getElementById('btn-wh-create').addEventListener('click', createWarehouseShipment);
+    document.getElementById('btn-shipping-close').addEventListener('click', closeShippingModal);
+    document.getElementById('shipping-overlay').addEventListener('click', closeShippingModal);
+    document.getElementById('btn-shipping-refresh').addEventListener('click', async () => {
+        if (!activePartOrderId) return;
+        const res = await fetch(`/api/part-orders/${activePartOrderId}/refresh-tracking`, { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) { alert(data.message || 'Refresh failed'); return; }
+        await renderShippingModal();
+        if (selectedDeviceId) await loadJobsForDevice(selectedDeviceId);
+    });
+    document.getElementById('btn-shipping-save-stage').addEventListener('click', async () => {
+        if (!activePartOrderId) return;
+        const stage = document.getElementById('shipping-stage-select').value;
+        const res = await fetch(`/api/part-orders/${activePartOrderId}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ shipping_stage: stage }),
+        });
+        const data = await res.json();
+        if (!res.ok) { alert(data.message || 'Update failed'); return; }
+        await renderShippingModal();
+        if (selectedDeviceId) await loadJobsForDevice(selectedDeviceId);
+    });
+    document.getElementById('btn-taobao-close').addEventListener('click', () => taobaoModal.classList.add('hidden'));
+    document.getElementById('taobao-overlay').addEventListener('click', () => taobaoModal.classList.add('hidden'));
+
+    function llmPayload() {
+        const payload = {
+            llm_enabled: document.getElementById('set-llm-enabled').checked,
+            llm_base_url: document.getElementById('set-llm-url').value.trim(),
+            llm_model: document.getElementById('set-llm-model').value.trim(),
+        };
+        const key = document.getElementById('set-llm-key').value.trim();
+        if (key) payload.llm_api_key = key;
+        return payload;
+    }
+
+    function showSettingsStatus(ok, message) {
+        const el = document.getElementById('set-llm-status');
+        el.classList.remove('hidden', 'text-red-600', 'text-emerald-700');
+        el.classList.add(ok ? 'text-emerald-700' : 'text-red-600');
+        el.textContent = message;
+    }
+
+    async function openSettingsModal() {
+        settingsModal.classList.remove('hidden');
+        document.getElementById('set-llm-status').classList.add('hidden');
+        document.getElementById('set-llm-key').value = '';
+        try {
+            const res = await fetch('/api/settings');
+            const data = await res.json();
+            document.getElementById('set-llm-enabled').checked = Boolean(data.llm_enabled);
+            document.getElementById('set-llm-url').value = data.llm_base_url || 'https://api.openai.com/v1';
+            document.getElementById('set-llm-model').value = data.llm_model || 'gpt-4o-mini';
+            document.getElementById('set-llm-key-hint').classList.toggle('hidden', !data.llm_api_key_set);
+            document.getElementById('set-llm-key').placeholder = data.llm_api_key_set ? 'Leave blank to keep saved key' : 'sk-…';
+        } catch (err) {
+            showSettingsStatus(false, err.message || 'Failed to load settings');
+        }
+    }
+
+    function closeSettingsModal() {
+        settingsModal.classList.add('hidden');
+    }
+
+    document.getElementById('btn-settings').addEventListener('click', openSettingsModal);
+    document.getElementById('btn-settings-close').addEventListener('click', closeSettingsModal);
+    document.getElementById('settings-overlay').addEventListener('click', closeSettingsModal);
+    document.getElementById('btn-settings-save').addEventListener('click', async () => {
+        const btn = document.getElementById('btn-settings-save');
+        btn.disabled = true;
+        try {
+            const res = await fetch('/api/settings', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(llmPayload()),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.message || 'Save failed');
+            document.getElementById('set-llm-key').value = '';
+            document.getElementById('set-llm-key-hint').classList.toggle('hidden', !data.llm_api_key_set);
+            showSettingsStatus(true, data.llm_enabled
+                ? (data.llm_api_key_set
+                    ? 'Saved. After import, click Retry unmatched with LLM.'
+                    : 'Saved. LLM is on — add an API key (or a dummy key for local servers).')
+                : 'Saved. LLM matching is off.');
+        } catch (err) {
+            showSettingsStatus(false, err.message || 'Save failed');
+        } finally {
+            btn.disabled = false;
+        }
+    });
+    document.getElementById('btn-settings-test').addEventListener('click', async () => {
+        const btn = document.getElementById('btn-settings-test');
+        btn.disabled = true;
+        btn.textContent = 'Testing…';
+        try {
+            const res = await fetch('/api/settings/test-llm', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(llmPayload()),
+            });
+            const data = await res.json();
+            showSettingsStatus(Boolean(data.success), data.message || (data.success ? 'Connected' : 'Test failed'));
+        } catch (err) {
+            showSettingsStatus(false, err.message || 'Test failed');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Test connection';
+        }
+    });
+
+    function renderTaobaoResults(data) {
+        const resultsEl = document.getElementById('taobao-results');
+        const llmBtn = document.getElementById('btn-taobao-llm');
+        lastImportBatchId = data.batch_id || lastImportBatchId;
+        resultsEl.classList.remove('hidden');
+        const lines = (data.results || []).map((r) => {
+            const src = r.match_source === 'llm' ? ' · LLM' : (r.match_source === 'mixed' ? ' · mixed' : '');
+            if (r.status === 'matched') {
+                const jobs = (r.matched_jobs || []).map((m) => `#${m.inventory_id} ${m.part_name}`).join(', ');
+                return `✅ New${src}: ${escapeHtml((r.product_name || '').slice(0, 40))}… → ${jobs}`;
+            }
+            if (r.status === 'updated') {
+                const jobs = (r.updated_bindings || []).map((m) => `#${m.inventory_id} ${m.part_name}`).join(', ');
+                return `🔄 Updated: ${escapeHtml(r.order_id)} → ${jobs}`;
+            }
+            if (r.status === 'skipped_duplicate') return `⏭ ${escapeHtml(r.order_id)} (already bound)`;
+            const hint = [r.inferred_part || 'unknown part', r.inferred_model].filter(Boolean).join(', ');
+            return `❌ ${escapeHtml((r.product_name || '').slice(0, 40))}… — no match (${escapeHtml(hint)})`;
+        });
+        const llmNote = data.llm_match_count ? `, LLM ${data.llm_match_count}` : '';
+        const unmatched = data.unmatched_count || 0;
+        lastImportUnmatched = unmatched;
+        resultsEl.innerHTML = `<p class="font-semibold mb-2">Matched ${data.matched_count}, updated ${data.updated_count || 0} of ${data.total_rows} rows${llmNote}${unmatched ? `, ${unmatched} unmatched` : ''}</p>${lines.map((l) => `<div class="py-1 border-b border-gray-200 last:border-0">${l}</div>`).join('')}`;
+        llmBtn.disabled = !lastImportBatchId || unmatched <= 0;
+    }
+
+    document.getElementById('btn-taobao-upload').addEventListener('click', async () => {
+        const fileInput = document.getElementById('taobao-file');
+        if (!fileInput.files || !fileInput.files[0]) {
+            alert('Choose an .xlsx file first');
+            return;
+        }
+        const form = new FormData();
+        form.append('file', fileInput.files[0]);
+        const btn = document.getElementById('btn-taobao-upload');
+        btn.disabled = true;
+        btn.textContent = 'Importing…';
+        try {
+            const res = await fetch('/api/taobao/import', { method: 'POST', body: form });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.message || 'Import failed');
+            await loadInventory();
+            if (selectedDeviceId) await loadJobsForDevice(selectedDeviceId);
+            renderTaobaoResults(data);
+        } catch (err) {
+            alert(err.message || 'Import failed');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Upload & Match';
+        }
+    });
+
+    document.getElementById('btn-taobao-llm').addEventListener('click', async () => {
+        if (!lastImportBatchId) {
+            alert('Upload a sheet first.');
+            return;
+        }
+        const btn = document.getElementById('btn-taobao-llm');
+        btn.disabled = true;
+        btn.textContent = 'Matching with LLM…';
+        try {
+            const res = await fetch(`/api/taobao/import/${encodeURIComponent(lastImportBatchId)}/llm-match`, {
+                method: 'POST',
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                if (res.status === 400 && /settings/i.test(data.message || '')) {
+                    alert(data.message || 'Configure the LLM API in Settings first.');
+                    document.getElementById('btn-settings').click();
+                    return;
+                }
+                throw new Error(data.message || 'LLM matching failed');
+            }
+            await loadInventory();
+            if (selectedDeviceId) await loadJobsForDevice(selectedDeviceId);
+            renderTaobaoResults(data);
+        } catch (err) {
+            alert(err.message || 'LLM matching failed');
+        } finally {
+            btn.disabled = !lastImportBatchId || lastImportUnmatched <= 0;
+            btn.textContent = 'Retry unmatched with LLM';
+        }
+    });
+
     elements.lockStatus.addEventListener('change', () => styleLockSelect(elements.lockStatus));
     elements.model.addEventListener('input', () => {
         elements.title.innerText = elements.model.value.trim() || `Device #${currentItemId}`;

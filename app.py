@@ -12,6 +12,24 @@ from database import init_db
 from vision import analyze_photos
 from repair_parts import determine_parts_needed as map_parts_needed
 from ocr_label import extract_label_fields, parse_comma_payload
+from parts_format import parse_parts, serialize_parts
+from repair_jobs import sync_repair_jobs, fetch_jobs_for_inventory, fetch_job_counts
+from taobao_import_apply import apply_taobao_import, apply_taobao_llm_retry
+from part_orders import (
+    STAGE_LABELS,
+    delete_part_order_for_job,
+    get_part_order,
+    get_part_order_by_job,
+    list_assignable_part_orders,
+    list_warehouse_shipments,
+    create_warehouse_shipment,
+    get_warehouse_shipment,
+    set_shipping_stage,
+    save_domestic_tracking,
+)
+from shipping_tracker import fetch_domestic_tracking, resolve_carrier_code
+from app_settings import get_settings, public_settings, update_settings
+from llm_match import llm_configured, test_llm_connection
 
 app = Flask(__name__, static_folder='static')
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max upload
@@ -23,10 +41,24 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 # Initialize database on startup
 init_db()
 
+
 def get_db_connection():
-    conn = sqlite3.connect('inventory.db')
+    conn = sqlite3.connect('inventory.db', timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA foreign_keys = ON')
     return conn
+
+
+def _sync_all_repair_jobs():
+    conn = get_db_connection()
+    rows = conn.execute("SELECT id, parts_needed FROM inventory").fetchall()
+    for row in rows:
+        sync_repair_jobs(conn, row["id"], row["parts_needed"])
+    conn.commit()
+    conn.close()
+
+
+_sync_all_repair_jobs()
 
 def analyze_damage_vision_api(front_image_path, back_image_path):
     """Run the device-vision classifiers on saved front/back photos."""
@@ -190,8 +222,16 @@ def serve_uploads(filename):
 def get_inventory():
     conn = get_db_connection()
     inventory = conn.execute('SELECT * FROM inventory ORDER BY id DESC').fetchall()
+    job_counts = fetch_job_counts(conn)
     conn.close()
-    return jsonify([dict(ix) for ix in inventory])
+    items = []
+    for ix in inventory:
+        item = dict(ix)
+        counts = job_counts.get(item["id"], {"pending": 0, "total": 0})
+        item["pending_jobs"] = counts["pending"]
+        item["total_jobs"] = counts["total"]
+        items.append(item)
+    return jsonify(items)
 
 @app.route('/api/scan', methods=['POST'])
 def scan_photos():
@@ -263,6 +303,7 @@ def add_inventory():
     parts_needed = determine_parts_needed(
         damage_condition, remarks, battery_health, model=model
     )
+    parts_json = serialize_parts([{"name": p, "needs_programming": False} for p in parts_needed])
     
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -276,12 +317,14 @@ def add_inventory():
     ''', (
         date_received, model, color, capacity, serial_number,
         ios_version, imei, battery_health, remarks,
-        front_image_url, back_image_url, damage_condition, json.dumps(parts_needed),
+        front_image_url, back_image_url, damage_condition, parts_json,
         vision_device_type, lock_status, inventory_number
     ))
     
     conn.commit()
     new_id = cursor.lastrowid
+    sync_repair_jobs(conn, new_id, parts_json)
+    conn.commit()
     conn.close()
     
     return jsonify({
@@ -309,9 +352,9 @@ def update_inventory(item_id):
         if not isinstance(parts, list):
             conn.close()
             return jsonify({'success': False, 'message': 'parts_needed must be a list'}), 400
-        cleaned = [str(p).strip() for p in parts if str(p).strip()]
+        parts_json = serialize_parts(parts)
         fields.append('parts_needed = ?')
-        values.append(json.dumps(cleaned))
+        values.append(parts_json)
 
     if 'remarks' in data:
         fields.append('remarks = ?')
@@ -351,10 +394,16 @@ def update_inventory(item_id):
 
     values.append(item_id)
     conn.execute(f"UPDATE inventory SET {', '.join(fields)} WHERE id = ?", values)
+    if 'parts_needed' in data:
+        sync_repair_jobs(conn, item_id, parts_json)
     conn.commit()
     updated = conn.execute('SELECT * FROM inventory WHERE id = ?', (item_id,)).fetchone()
+    row_dict = dict(updated)
+    counts = fetch_job_counts(conn).get(item_id, {"pending": 0, "total": 0})
+    row_dict["pending_jobs"] = counts["pending"]
+    row_dict["total_jobs"] = counts["total"]
     conn.close()
-    return jsonify({'success': True, 'item': dict(updated)})
+    return jsonify({'success': True, 'item': row_dict})
 
 
 def _delete_upload_file(image_url):
@@ -380,6 +429,8 @@ def delete_inventory(item_id):
         return jsonify({'success': False, 'message': 'Item not found'}), 404
 
     item = dict(row)
+    conn.execute('DELETE FROM part_orders WHERE inventory_id = ?', (item_id,))
+    conn.execute('DELETE FROM repair_jobs WHERE inventory_id = ?', (item_id,))
     conn.execute('DELETE FROM inventory WHERE id = ?', (item_id,))
     conn.commit()
     conn.close()
@@ -388,6 +439,361 @@ def delete_inventory(item_id):
     _delete_upload_file(item.get('back_image_url'))
 
     return jsonify({'success': True, 'message': 'Device deleted'})
+
+
+@app.route('/api/inventory/<int:item_id>/jobs', methods=['GET'])
+def get_inventory_jobs(item_id):
+    conn = get_db_connection()
+    row = conn.execute('SELECT id FROM inventory WHERE id = ?', (item_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Item not found'}), 404
+    jobs = fetch_jobs_for_inventory(conn, item_id)
+    enriched = []
+    for job in jobs:
+        j = dict(job)
+        if j.get('job_type') == 'order_part':
+            po = get_part_order_by_job(conn, j['id'])
+            if po:
+                j['part_order'] = {
+                    'id': po['id'],
+                    'shipping_stage': po['shipping_stage'],
+                    'shipping_label': STAGE_LABELS.get(po['shipping_stage'], po['shipping_stage']),
+                    'taobao_order_id': po['taobao_order_id'],
+                    'domestic_carrier': po.get('domestic_carrier'),
+                    'domestic_tracking_number': po.get('domestic_tracking_number'),
+                }
+        enriched.append(j)
+    conn.close()
+    return jsonify({'success': True, 'jobs': enriched})
+
+
+@app.route('/api/inventory/<int:item_id>/jobs', methods=['POST'])
+def add_custom_job(item_id):
+    data = request.json or {}
+    title = (data.get('title') or '').strip()
+    if not title:
+        return jsonify({'success': False, 'message': 'title is required'}), 400
+
+    conn = get_db_connection()
+    row = conn.execute('SELECT id FROM inventory WHERE id = ?', (item_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Item not found'}), 404
+
+    max_sort = conn.execute(
+        'SELECT COALESCE(MAX(sort_order), 0) AS m FROM repair_jobs WHERE inventory_id = ?',
+        (item_id,),
+    ).fetchone()['m']
+
+    cursor = conn.cursor()
+    cursor.execute(
+        '''
+        INSERT INTO repair_jobs (inventory_id, job_type, part_name, title, status, sort_order)
+        VALUES (?, 'custom', NULL, ?, 'pending', ?)
+        ''',
+        (item_id, title, max_sort + 1),
+    )
+    conn.commit()
+    job = dict(conn.execute('SELECT * FROM repair_jobs WHERE id = ?', (cursor.lastrowid,)).fetchone())
+    conn.close()
+    return jsonify({'success': True, 'job': job}), 201
+
+
+@app.route('/api/jobs/<int:job_id>', methods=['PATCH'])
+def update_job(job_id):
+    data = request.json or {}
+    conn = get_db_connection()
+    row = conn.execute('SELECT * FROM repair_jobs WHERE id = ?', (job_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Job not found'}), 404
+
+    fields = []
+    values = []
+    if 'status' in data:
+        status = data['status']
+        if status not in ('pending', 'done'):
+            conn.close()
+            return jsonify({'success': False, 'message': 'status must be pending or done'}), 400
+        fields.append('status = ?')
+        values.append(status)
+        if status == 'done':
+            fields.append("completed_at = datetime('now')")
+        else:
+            fields.append('completed_at = NULL')
+            fields.append('taobao_order_id = NULL')
+            fields.append('taobao_product_name = NULL')
+            if row['job_type'] == 'order_part':
+                delete_part_order_for_job(conn, job_id)
+
+    if 'title' in data and row['job_type'] == 'custom':
+        title = (data.get('title') or '').strip()
+        if title:
+            fields.append('title = ?')
+            values.append(title)
+
+    if not fields:
+        conn.close()
+        return jsonify({'success': False, 'message': 'No updatable fields'}), 400
+
+    values.append(job_id)
+    conn.execute(f"UPDATE repair_jobs SET {', '.join(fields)} WHERE id = ?", values)
+    conn.commit()
+    job = dict(conn.execute('SELECT * FROM repair_jobs WHERE id = ?', (job_id,)).fetchone())
+    conn.close()
+    return jsonify({'success': True, 'job': job})
+
+
+@app.route('/api/jobs/<int:job_id>', methods=['DELETE'])
+def delete_job(job_id):
+    conn = get_db_connection()
+    row = conn.execute('SELECT * FROM repair_jobs WHERE id = ?', (job_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Job not found'}), 404
+    if row['job_type'] != 'custom':
+        conn.close()
+        return jsonify({'success': False, 'message': 'Only custom jobs can be deleted'}), 400
+    conn.execute('DELETE FROM repair_jobs WHERE id = ?', (job_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
+
+@app.route('/api/taobao/import', methods=['POST'])
+def import_taobao():
+    if 'file' not in request.files:
+        return jsonify({'success': False, 'message': 'file is required'}), 400
+    upload = request.files['file']
+    if not upload.filename:
+        return jsonify({'success': False, 'message': 'Empty filename'}), 400
+    if not upload.filename.lower().endswith(('.xlsx', '.xlsm')):
+        return jsonify({'success': False, 'message': 'Upload a .xlsx Taobao export'}), 400
+
+    conn = get_db_connection()
+    try:
+        result = apply_taobao_import(conn, upload.read())
+    except ValueError as exc:
+        return jsonify({'success': False, 'message': str(exc)}), 400
+    except Exception as exc:
+        print(f"[taobao] import error: {exc}")
+        return jsonify({'success': False, 'message': 'Failed to parse spreadsheet'}), 500
+    finally:
+        conn.close()
+
+    return jsonify({'success': True, **result})
+
+
+@app.route('/api/taobao/import/<batch_id>/llm-match', methods=['POST'])
+def taobao_llm_match(batch_id):
+    conn = get_db_connection()
+    try:
+        settings = get_settings(conn)
+        if (settings.get('llm_enabled') or '0') != '1':
+            return jsonify({
+                'success': False,
+                'message': 'Turn on Enable LLM matching in Settings, then Save.',
+            }), 400
+        if not llm_configured(settings):
+            return jsonify({
+                'success': False,
+                'message': 'Configure the LLM API in Settings first.',
+            }), 400
+        result = apply_taobao_llm_retry(conn, batch_id, settings)
+    except ValueError as exc:
+        return jsonify({'success': False, 'message': str(exc)}), 400
+    except Exception as exc:
+        print(f"[taobao] llm match error: {exc}")
+        return jsonify({'success': False, 'message': 'LLM matching failed'}), 500
+    finally:
+        conn.close()
+
+    return jsonify({'success': True, **result})
+
+
+@app.route('/api/settings', methods=['GET'])
+def settings_get():
+    conn = get_db_connection()
+    data = public_settings(get_settings(conn))
+    conn.close()
+    return jsonify({'success': True, **data})
+
+
+@app.route('/api/settings', methods=['PUT'])
+def settings_put():
+    payload = request.json or {}
+    conn = get_db_connection()
+    updated = update_settings(conn, payload)
+    conn.commit()
+    public = public_settings(updated)
+    conn.close()
+    return jsonify({'success': True, **public})
+
+
+@app.route('/api/settings/test-llm', methods=['POST'])
+def settings_test_llm():
+    payload = request.json or {}
+    conn = get_db_connection()
+    settings = get_settings(conn)
+    conn.close()
+    if payload.get('llm_base_url'):
+        settings['llm_base_url'] = str(payload['llm_base_url']).strip().rstrip('/')
+    if payload.get('llm_model'):
+        settings['llm_model'] = str(payload['llm_model']).strip()
+    new_key = str(payload.get('llm_api_key') or '').strip()
+    if new_key and not set(new_key) <= {'•', '*'}:
+        settings['llm_api_key'] = new_key
+    result = test_llm_connection(settings)
+    status = 200 if result.get('success') else 400
+    return jsonify(result), status
+
+
+@app.route('/api/part-orders/<int:part_order_id>', methods=['GET'])
+def part_order_detail(part_order_id):
+    conn = get_db_connection()
+    po = get_part_order(conn, part_order_id)
+    conn.close()
+    if not po:
+        return jsonify({'success': False, 'message': 'Part order not found'}), 404
+    return jsonify({'success': True, 'part_order': po})
+
+
+@app.route('/api/part-orders/<int:part_order_id>', methods=['PATCH'])
+def part_order_update(part_order_id):
+    data = request.json or {}
+    conn = get_db_connection()
+    po = get_part_order(conn, part_order_id)
+    if not po:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Part order not found'}), 404
+    if 'shipping_stage' in data:
+        po = set_shipping_stage(conn, part_order_id, data['shipping_stage'])
+    if data.get('domestic_carrier') or data.get('domestic_tracking_number'):
+        carrier = (data.get('domestic_carrier') or po.get('domestic_carrier') or '').strip()
+        tracking = (data.get('domestic_tracking_number') or po.get('domestic_tracking_number') or '').strip()
+        code = resolve_carrier_code(carrier, tracking)
+        result = fetch_domestic_tracking(code or '', tracking) if tracking else {'success': False, 'events': []}
+        po = save_domestic_tracking(conn, part_order_id, result.get('carrier_code') or carrier, tracking, result)
+    conn.commit()
+    po = get_part_order(conn, part_order_id)
+    conn.close()
+    return jsonify({'success': True, 'part_order': po})
+
+
+@app.route('/api/part-orders/<int:part_order_id>/refresh-tracking', methods=['POST'])
+def part_order_refresh_tracking(part_order_id):
+    conn = get_db_connection()
+    po = get_part_order(conn, part_order_id)
+    if not po:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Part order not found'}), 404
+    tracking = po.get('domestic_tracking_number') or ''
+    if not tracking:
+        conn.close()
+        return jsonify({'success': False, 'message': 'No domestic tracking number on this order'}), 400
+    code = resolve_carrier_code(po.get('domestic_carrier') or '', tracking)
+    result = fetch_domestic_tracking(code or '', tracking)
+    po = save_domestic_tracking(
+        conn,
+        part_order_id,
+        result.get('carrier_code') or po.get('domestic_carrier') or '',
+        tracking,
+        result,
+    )
+    conn.commit()
+    po = get_part_order(conn, part_order_id)
+    conn.close()
+    return jsonify({'success': True, 'part_order': po, 'tracking': result})
+
+
+@app.route('/api/part-orders/assignable', methods=['GET'])
+def part_orders_assignable():
+    conn = get_db_connection()
+    items = list_assignable_part_orders(conn)
+    conn.close()
+    return jsonify({'success': True, 'part_orders': items})
+
+
+@app.route('/api/warehouse-shipments', methods=['GET'])
+def warehouse_shipments_list():
+    conn = get_db_connection()
+    shipments = list_warehouse_shipments(conn)
+    conn.close()
+    return jsonify({'success': True, 'shipments': shipments})
+
+
+@app.route('/api/warehouse-shipments', methods=['POST'])
+def warehouse_shipments_create():
+    data = request.json or {}
+    tracking = (data.get('tracking_number') or '').strip()
+    carrier = (data.get('carrier') or '').strip()
+    notes = (data.get('notes') or '').strip()
+    part_order_ids = data.get('part_order_ids') or []
+    if not isinstance(part_order_ids, list):
+        return jsonify({'success': False, 'message': 'part_order_ids must be a list'}), 400
+    try:
+        conn = get_db_connection()
+        shipment = create_warehouse_shipment(
+            conn,
+            tracking_number=tracking,
+            carrier=carrier,
+            notes=notes,
+            part_order_ids=[int(x) for x in part_order_ids],
+        )
+        conn.commit()
+        conn.close()
+    except ValueError as exc:
+        return jsonify({'success': False, 'message': str(exc)}), 400
+    return jsonify({'success': True, 'shipment': shipment}), 201
+
+
+@app.route('/api/warehouse-shipments/<int:shipment_id>', methods=['GET'])
+def warehouse_shipment_detail(shipment_id):
+    conn = get_db_connection()
+    try:
+        shipment = get_warehouse_shipment(conn, shipment_id)
+    except ValueError as exc:
+        conn.close()
+        return jsonify({'success': False, 'message': str(exc)}), 404
+    conn.close()
+    return jsonify({'success': True, 'shipment': shipment})
+
+
+@app.route('/api/warehouse-shipments/<int:shipment_id>', methods=['PATCH'])
+def warehouse_shipment_update(shipment_id):
+    data = request.json or {}
+    conn = get_db_connection()
+    row = conn.execute('SELECT id FROM warehouse_shipments WHERE id = ?', (shipment_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Shipment not found'}), 404
+    fields = []
+    values = []
+    for key in ('tracking_number', 'carrier', 'notes', 'status'):
+        if key in data:
+            fields.append(f'{key} = ?')
+            values.append((data.get(key) or '').strip())
+    if fields:
+        fields.append("updated_at = datetime('now')")
+        values.append(shipment_id)
+        conn.execute(f"UPDATE warehouse_shipments SET {', '.join(fields)} WHERE id = ?", values)
+    if data.get('mark_delivered'):
+        conn.execute(
+            "UPDATE warehouse_shipments SET status = 'delivered', updated_at = datetime('now') WHERE id = ?",
+            (shipment_id,),
+        )
+        conn.execute(
+            """
+            UPDATE part_orders SET shipping_stage = 'delivered', updated_at = datetime('now')
+            WHERE warehouse_shipment_id = ?
+            """,
+            (shipment_id,),
+        )
+    conn.commit()
+    shipment = get_warehouse_shipment(conn, shipment_id)
+    conn.close()
+    return jsonify({'success': True, 'shipment': shipment})
 
 
 if __name__ == '__main__':
