@@ -14,7 +14,7 @@ from repair_parts import determine_parts_needed as map_parts_needed
 from ocr_label import extract_label_fields, parse_comma_payload
 from parts_format import parse_parts, serialize_parts
 from repair_jobs import sync_repair_jobs, fetch_jobs_for_inventory, fetch_job_counts
-from taobao_import_apply import apply_taobao_import
+from taobao_import_apply import apply_taobao_import, apply_taobao_llm_retry
 from part_orders import (
     STAGE_LABELS,
     delete_part_order_for_job,
@@ -28,6 +28,8 @@ from part_orders import (
     save_domestic_tracking,
 )
 from shipping_tracker import fetch_domestic_tracking, resolve_carrier_code
+from app_settings import get_settings, public_settings, update_settings
+from llm_match import llm_configured, test_llm_connection
 
 app = Flask(__name__, static_folder='static')
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max upload
@@ -43,6 +45,7 @@ init_db()
 def get_db_connection():
     conn = sqlite3.connect('inventory.db', timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA foreign_keys = ON')
     return conn
 
 
@@ -426,6 +429,7 @@ def delete_inventory(item_id):
         return jsonify({'success': False, 'message': 'Item not found'}), 404
 
     item = dict(row)
+    conn.execute('DELETE FROM part_orders WHERE inventory_id = ?', (item_id,))
     conn.execute('DELETE FROM repair_jobs WHERE inventory_id = ?', (item_id,))
     conn.execute('DELETE FROM inventory WHERE id = ?', (item_id,))
     conn.commit()
@@ -567,17 +571,82 @@ def import_taobao():
     if not upload.filename.lower().endswith(('.xlsx', '.xlsm')):
         return jsonify({'success': False, 'message': 'Upload a .xlsx Taobao export'}), 400
 
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
         result = apply_taobao_import(conn, upload.read())
-        conn.close()
     except ValueError as exc:
         return jsonify({'success': False, 'message': str(exc)}), 400
     except Exception as exc:
         print(f"[taobao] import error: {exc}")
         return jsonify({'success': False, 'message': 'Failed to parse spreadsheet'}), 500
+    finally:
+        conn.close()
 
     return jsonify({'success': True, **result})
+
+
+@app.route('/api/taobao/import/<batch_id>/llm-match', methods=['POST'])
+def taobao_llm_match(batch_id):
+    conn = get_db_connection()
+    try:
+        settings = get_settings(conn)
+        if (settings.get('llm_enabled') or '0') != '1':
+            return jsonify({
+                'success': False,
+                'message': 'Turn on Enable LLM matching in Settings, then Save.',
+            }), 400
+        if not llm_configured(settings):
+            return jsonify({
+                'success': False,
+                'message': 'Configure the LLM API in Settings first.',
+            }), 400
+        result = apply_taobao_llm_retry(conn, batch_id, settings)
+    except ValueError as exc:
+        return jsonify({'success': False, 'message': str(exc)}), 400
+    except Exception as exc:
+        print(f"[taobao] llm match error: {exc}")
+        return jsonify({'success': False, 'message': 'LLM matching failed'}), 500
+    finally:
+        conn.close()
+
+    return jsonify({'success': True, **result})
+
+
+@app.route('/api/settings', methods=['GET'])
+def settings_get():
+    conn = get_db_connection()
+    data = public_settings(get_settings(conn))
+    conn.close()
+    return jsonify({'success': True, **data})
+
+
+@app.route('/api/settings', methods=['PUT'])
+def settings_put():
+    payload = request.json or {}
+    conn = get_db_connection()
+    updated = update_settings(conn, payload)
+    conn.commit()
+    public = public_settings(updated)
+    conn.close()
+    return jsonify({'success': True, **public})
+
+
+@app.route('/api/settings/test-llm', methods=['POST'])
+def settings_test_llm():
+    payload = request.json or {}
+    conn = get_db_connection()
+    settings = get_settings(conn)
+    conn.close()
+    if payload.get('llm_base_url'):
+        settings['llm_base_url'] = str(payload['llm_base_url']).strip().rstrip('/')
+    if payload.get('llm_model'):
+        settings['llm_model'] = str(payload['llm_model']).strip()
+    new_key = str(payload.get('llm_api_key') or '').strip()
+    if new_key and not set(new_key) <= {'•', '*'}:
+        settings['llm_api_key'] = new_key
+    result = test_llm_connection(settings)
+    status = 200 if result.get('success') else 400
+    return jsonify(result), status
 
 
 @app.route('/api/part-orders/<int:part_order_id>', methods=['GET'])

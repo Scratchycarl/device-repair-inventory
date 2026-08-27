@@ -2,6 +2,7 @@ import sqlite3
 
 def init_db():
     conn = sqlite3.connect('inventory.db')
+    conn.execute('PRAGMA foreign_keys = ON')
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -131,6 +132,12 @@ def init_db():
         conn.commit()
     except Exception as exc:
         print(f"part_orders migration note: {exc}")
+    try:
+        from app_settings import ensure_settings_table
+        ensure_settings_table(conn)
+        conn.commit()
+    except Exception as exc:
+        print(f"app_settings migration note: {exc}")
 
     conn.close()
     print("Database initialized.")

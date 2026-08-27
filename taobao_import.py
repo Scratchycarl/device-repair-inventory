@@ -18,10 +18,10 @@ PART_KEYWORD_GROUPS: list[tuple[list[str], str | None]] = [
     (["摄像头", "相机", "后置摄像", "前置摄像"], "Camera Module"),
     (["听筒"], "Earpiece Speaker"),
     (["扬声器", "喇叭"], "Loudspeaker"),
-    (["wifi", "天线"], "WiFi Antenna"),
+    (["wifi天线", "wifi 天线", "wifi"], "WiFi Antenna"),
     (["face id", "面容", "truedepth"], "Face ID / TrueDepth"),
     (["home键", "home button", "指纹键"], "Home Button"),
-    (["oled", "屏幕总成", "显示屏", "屏幕", "液晶", "总成"], None),
+    (["oled", "屏幕总成", "显示屏", "屏幕", "液晶"], None),
     (["lcd"], "LCD Assembly"),
     (["digitizer", "触摸", "外屏"], "Digitizer"),
 ]
@@ -30,32 +30,46 @@ PART_KEYWORD_GROUPS: list[tuple[list[str], str | None]] = [
 def _cell_str(value: Any) -> str:
     if value is None:
         return ""
+    if hasattr(value, "value"):
+        value = value.value
+        if value is None:
+            return ""
     return str(value).strip()
 
 
-def _pick_column(cells: list, col_map: dict[str, int], names: tuple[str, ...]) -> str:
+def _resolve_col(col_map: dict[str, int], names: tuple[str, ...]) -> int | None:
+    """Exact header first, then substring (Taobao adds parenthetical notes)."""
     for name in names:
-        idx = col_map.get(name)
-        if idx is not None and idx < len(cells):
-            value = _cell_str(cells[idx])
-            if value:
-                return value
-    return ""
-
-
-def _parse_header_row(sheet) -> tuple[int, dict[str, int]] | None:
-    for row_idx, row in enumerate(sheet.iter_rows(min_row=1, max_row=15, values_only=True), start=1):
-        headers = [_cell_str(c) for c in row]
-        if "订单号" in headers:
-            col_map = {name: idx for idx, name in enumerate(headers) if name}
-            return row_idx, col_map
+        if name in col_map:
+            return col_map[name]
+    for header, idx in col_map.items():
+        for name in names:
+            if name and name in header:
+                return idx
     return None
+
+
+def _pick_column(cells: list, col_map: dict[str, int], names: tuple[str, ...]) -> str:
+    idx = _resolve_col(col_map, names)
+    if idx is None or idx >= len(cells):
+        return ""
+    return _cell_str(cells[idx])
 
 
 def parse_taobao_xlsx(file_bytes: bytes) -> list[dict[str, Any]]:
     wb = load_workbook(BytesIO(file_bytes), read_only=True, data_only=True)
     sheet = wb.active
-    header_info = _parse_header_row(sheet)
+    # Materialize once — read-only sheets cannot be iterated twice.
+    rows = [list(row) for row in sheet.iter_rows(values_only=True)]
+    wb.close()
+
+    header_info = None
+    for row_idx, row in enumerate(rows[:15], start=1):
+        headers = [_cell_str(c) for c in row]
+        if "订单号" in headers:
+            col_map = {name: idx for idx, name in enumerate(headers) if name}
+            header_info = (row_idx, col_map)
+            break
     if not header_info:
         raise ValueError("Could not find Taobao header row (订单号).")
 
@@ -65,11 +79,10 @@ def parse_taobao_xlsx(file_bytes: bytes) -> list[dict[str, Any]]:
         if key not in col_map:
             raise ValueError(f"Missing column: {key}")
 
-    qty_indices = [i for i, h in enumerate(sheet[header_row]) if _cell_str(h) == "商品数量"]
-    qty_col = qty_indices[0] if qty_indices else None
+    qty_col = _resolve_col(col_map, ("商品数量",))
 
     orders: list[dict[str, Any]] = []
-    for row in sheet.iter_rows(min_row=header_row + 1, values_only=True):
+    for row in rows[header_row:]:
         cells = list(row)
         order_id = _cell_str(cells[col_map["订单号"]]) if col_map["订单号"] < len(cells) else ""
         if not order_id:
@@ -111,7 +124,7 @@ def parse_taobao_xlsx(file_bytes: bytes) -> list[dict[str, Any]]:
                     "物流公司", "快递公司", "承运公司",
                 )),
                 "domestic_tracking_number": _pick_column(cells, col_map, (
-                    "运单号", "快递单号", "物流单号", "物流编号",
+                    "物流单号", "运单号", "快递单号", "物流编号",
                 )),
                 "logistics_status": _pick_column(cells, col_map, (
                     "物流状态", "快递状态",
@@ -119,59 +132,92 @@ def parse_taobao_xlsx(file_bytes: bytes) -> list[dict[str, Any]]:
                 "search_text": f"{product_name} {variant}".lower(),
             }
         )
-    wb.close()
     return orders
 
 
+def _model_family(text: str) -> str | None:
+    if "ipad" in text:
+        return "ipad"
+    if "iphone" in text:
+        return "iphone"
+    return None
+
+
+def _model_flags(text: str) -> tuple[bool, bool, bool, bool]:
+    return (
+        "pro" in text,
+        "max" in text or "plus" in text,
+        "mini" in text,
+        "air" in text,
+    )
+
+
 def extract_model_tokens(text: str) -> set[str]:
+    """Pull an Apple generation from 型号款式 (e.g. '14', '15 pro max', '精诚13…')."""
     lowered = text.lower()
     tokens: set[str] = set()
-    normalized = normalize_model(text)
 
     patterns = [
-        r"iphone\s*(\d{1,2})\s*pro\s*max",
-        r"iphone\s*(\d{1,2})\s*pro",
-        r"iphone\s*(\d{1,2})\s*plus",
-        r"iphone\s*(\d{1,2})",
-        r"(\d{1,2})\s*pro\s*max",
-        r"(\d{1,2})\s*promax",
-        r"(\d{1,2})\s*pro",
-        r"(\d{1,2})\s*plus",
+        r"iphone\s*\d{1,2}\s*pro\s*max",
+        r"iphone\s*\d{1,2}\s*pro",
+        r"iphone\s*\d{1,2}\s*plus",
+        r"iphone\s*\d{1,2}\s*mini",
+        r"iphone\s*\d{1,2}",
         r"ipad\s*pro",
         r"ipad\s*air",
         r"ipad\s*mini",
-        r"ipad\s*(\d+)",
+        r"ipad\s*\d+",
+        r"(?<!\d)(1[0-7]|[6-9])(?!\d)\s*pro\s*max",
+        r"(?<!\d)(1[0-7]|[6-9])(?!\d)\s*promax",
+        r"(?<!\d)(1[0-7]|[6-9])(?!\d)\s*pro",
+        r"(?<!\d)(1[0-7]|[6-9])(?!\d)\s*plus",
+        r"(?<!\d)(1[0-7]|[6-9])(?!\d)\s*mini",
+        r"(?<!\d)(1[0-7]|[6-9])(?!\d)",
+        r"(?<![a-z0-9])se(?:\s*[123])?(?![a-z0-9])",
     ]
     for pattern in patterns:
         m = re.search(pattern, lowered)
         if m:
             tokens.add(normalize_model(m.group(0)))
-
-    if "iphone" in normalized or re.search(r"\b1[0-7]\b", normalized):
-        tokens.add(normalized)
-    if "ipad" in normalized:
-        tokens.add(normalized)
+            break
     return tokens
+
+
+def order_model_tokens(order: dict[str, Any]) -> set[str]:
+    """Model comes from 型号款式; fall back to 商品名称 if style has none."""
+    tokens = extract_model_tokens(order.get("variant") or "")
+    if tokens:
+        return tokens
+    return extract_model_tokens(order.get("product_name") or "")
+
+
+def order_part_name(order: dict[str, Any], device_model: str | None = None) -> str | None:
+    """Part type comes from 商品名称 keywords (电池, 屏幕, …)."""
+    return infer_part_from_text(order.get("product_name") or "", device_model=device_model)
 
 
 def models_compatible(device_model: str, order_tokens: set[str]) -> bool:
     device_norm = normalize_model(device_model)
     if not device_norm or not order_tokens:
         return False
+    device_flags = _model_flags(device_norm)
+    device_family = _model_family(device_norm)
+    device_nums = re.findall(r"\d+", device_norm)
     for token in order_tokens:
         if not token:
             continue
-        if token in device_norm or device_norm in token:
-            return True
-        device_nums = re.findall(r"\d+", device_norm)
+        token_family = _model_family(token)
+        if device_family and token_family and device_family != token_family:
+            continue
+        if _model_flags(token) != device_flags:
+            continue
         token_nums = re.findall(r"\d+", token)
+        if token == device_norm:
+            return True
         if device_nums and token_nums and device_nums[0] == token_nums[0]:
-            device_pro = "pro" in device_norm
-            token_pro = "pro" in token
-            device_max = "max" in device_norm or "plus" in device_norm
-            token_max = "max" in token or "plus" in token
-            if device_pro == token_pro and device_max == token_max:
-                return True
+            return True
+        if not device_nums and not token_nums and device_family and device_family == token_family:
+            return True
     return False
 
 
@@ -197,7 +243,3 @@ def _part_names_match(job_part: str, inferred: str) -> bool:
     if job_part.lower() in inferred.lower() or inferred.lower() in job_part.lower():
         return True
     return False
-
-
-# Parsing only — import logic lives in taobao_import_apply.py
-

@@ -19,8 +19,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const taobaoModal = document.getElementById('taobao-modal');
     const shippingModal = document.getElementById('shipping-modal');
     const warehouseModal = document.getElementById('warehouse-modal');
+    const settingsModal = document.getElementById('settings-modal');
 
     let activePartOrderId = null;
+    let lastImportBatchId = null;
+    let lastImportUnmatched = 0;
 
     const SCREEN_PARTS = new Set(['OLED Assembly', 'LCD Assembly', 'Digitizer', 'Display Assembly']);
 
@@ -437,11 +440,17 @@ document.addEventListener('DOMContentLoaded', () => {
             shipList.innerHTML = '<p class="text-gray-400 italic">No warehouse shipments yet.</p>';
         } else {
             shipList.innerHTML = shipments.map((s) => `
-                <div class="border rounded-lg p-3">
-                    <div class="font-medium">${escapeHtml(s.tracking_number)} ${s.carrier ? '· ' + escapeHtml(s.carrier) : ''}</div>
-                    <div class="text-gray-500 text-xs">${s.item_count || 0} part(s) · ${escapeHtml(s.status)}</div>
+                <div class="border rounded-lg p-3 flex items-start justify-between gap-2">
+                    <div>
+                        <div class="font-medium">${escapeHtml(s.tracking_number)} ${s.carrier ? '· ' + escapeHtml(s.carrier) : ''}</div>
+                        <div class="text-gray-500 text-xs">${s.item_count || 0} part(s) · ${escapeHtml(s.status)}</div>
+                    </div>
+                    ${s.status !== 'delivered' ? `<button type="button" class="btn-wh-delivered shrink-0 text-xs text-indigo-700 hover:underline" data-id="${s.id}">Mark delivered</button>` : ''}
                 </div>
             `).join('');
+            shipList.querySelectorAll('.btn-wh-delivered').forEach((btn) => {
+                btn.addEventListener('click', () => markWarehouseDelivered(parseInt(btn.dataset.id, 10)));
+            });
         }
     }
 
@@ -462,6 +471,18 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('wh-tracking').value = '';
         document.getElementById('wh-carrier').value = '';
         document.getElementById('wh-notes').value = '';
+        await loadWarehouseModal();
+        if (selectedDeviceId) await loadJobsForDevice(selectedDeviceId);
+    }
+
+    async function markWarehouseDelivered(shipmentId) {
+        const res = await fetch(`/api/warehouse-shipments/${shipmentId}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mark_delivered: true }),
+        });
+        const data = await res.json();
+        if (!res.ok) { alert(data.message || 'Failed'); return; }
         await loadWarehouseModal();
         if (selectedDeviceId) await loadJobsForDevice(selectedDeviceId);
     }
@@ -902,6 +923,10 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('btn-taobao-import').addEventListener('click', () => {
         taobaoModal.classList.remove('hidden');
         document.getElementById('taobao-results').classList.add('hidden');
+        const llmBtn = document.getElementById('btn-taobao-llm');
+        llmBtn.disabled = true;
+        lastImportBatchId = null;
+        lastImportUnmatched = 0;
     });
     document.getElementById('btn-warehouse-shipments').addEventListener('click', openWarehouseModal);
     document.getElementById('btn-warehouse-close').addEventListener('click', closeWarehouseModal);
@@ -932,9 +957,121 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     document.getElementById('btn-taobao-close').addEventListener('click', () => taobaoModal.classList.add('hidden'));
     document.getElementById('taobao-overlay').addEventListener('click', () => taobaoModal.classList.add('hidden'));
+
+    function llmPayload() {
+        const payload = {
+            llm_enabled: document.getElementById('set-llm-enabled').checked,
+            llm_base_url: document.getElementById('set-llm-url').value.trim(),
+            llm_model: document.getElementById('set-llm-model').value.trim(),
+        };
+        const key = document.getElementById('set-llm-key').value.trim();
+        if (key) payload.llm_api_key = key;
+        return payload;
+    }
+
+    function showSettingsStatus(ok, message) {
+        const el = document.getElementById('set-llm-status');
+        el.classList.remove('hidden', 'text-red-600', 'text-emerald-700');
+        el.classList.add(ok ? 'text-emerald-700' : 'text-red-600');
+        el.textContent = message;
+    }
+
+    async function openSettingsModal() {
+        settingsModal.classList.remove('hidden');
+        document.getElementById('set-llm-status').classList.add('hidden');
+        document.getElementById('set-llm-key').value = '';
+        try {
+            const res = await fetch('/api/settings');
+            const data = await res.json();
+            document.getElementById('set-llm-enabled').checked = Boolean(data.llm_enabled);
+            document.getElementById('set-llm-url').value = data.llm_base_url || 'https://api.openai.com/v1';
+            document.getElementById('set-llm-model').value = data.llm_model || 'gpt-4o-mini';
+            document.getElementById('set-llm-key-hint').classList.toggle('hidden', !data.llm_api_key_set);
+            document.getElementById('set-llm-key').placeholder = data.llm_api_key_set ? 'Leave blank to keep saved key' : 'sk-…';
+        } catch (err) {
+            showSettingsStatus(false, err.message || 'Failed to load settings');
+        }
+    }
+
+    function closeSettingsModal() {
+        settingsModal.classList.add('hidden');
+    }
+
+    document.getElementById('btn-settings').addEventListener('click', openSettingsModal);
+    document.getElementById('btn-settings-close').addEventListener('click', closeSettingsModal);
+    document.getElementById('settings-overlay').addEventListener('click', closeSettingsModal);
+    document.getElementById('btn-settings-save').addEventListener('click', async () => {
+        const btn = document.getElementById('btn-settings-save');
+        btn.disabled = true;
+        try {
+            const res = await fetch('/api/settings', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(llmPayload()),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.message || 'Save failed');
+            document.getElementById('set-llm-key').value = '';
+            document.getElementById('set-llm-key-hint').classList.toggle('hidden', !data.llm_api_key_set);
+            showSettingsStatus(true, data.llm_enabled
+                ? (data.llm_api_key_set
+                    ? 'Saved. After import, click Retry unmatched with LLM.'
+                    : 'Saved. LLM is on — add an API key (or a dummy key for local servers).')
+                : 'Saved. LLM matching is off.');
+        } catch (err) {
+            showSettingsStatus(false, err.message || 'Save failed');
+        } finally {
+            btn.disabled = false;
+        }
+    });
+    document.getElementById('btn-settings-test').addEventListener('click', async () => {
+        const btn = document.getElementById('btn-settings-test');
+        btn.disabled = true;
+        btn.textContent = 'Testing…';
+        try {
+            const res = await fetch('/api/settings/test-llm', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(llmPayload()),
+            });
+            const data = await res.json();
+            showSettingsStatus(Boolean(data.success), data.message || (data.success ? 'Connected' : 'Test failed'));
+        } catch (err) {
+            showSettingsStatus(false, err.message || 'Test failed');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Test connection';
+        }
+    });
+
+    function renderTaobaoResults(data) {
+        const resultsEl = document.getElementById('taobao-results');
+        const llmBtn = document.getElementById('btn-taobao-llm');
+        lastImportBatchId = data.batch_id || lastImportBatchId;
+        resultsEl.classList.remove('hidden');
+        const lines = (data.results || []).map((r) => {
+            const src = r.match_source === 'llm' ? ' · LLM' : (r.match_source === 'mixed' ? ' · mixed' : '');
+            if (r.status === 'matched') {
+                const jobs = (r.matched_jobs || []).map((m) => `#${m.inventory_id} ${m.part_name}`).join(', ');
+                return `✅ New${src}: ${escapeHtml((r.product_name || '').slice(0, 40))}… → ${jobs}`;
+            }
+            if (r.status === 'updated') {
+                const jobs = (r.updated_bindings || []).map((m) => `#${m.inventory_id} ${m.part_name}`).join(', ');
+                return `🔄 Updated: ${escapeHtml(r.order_id)} → ${jobs}`;
+            }
+            if (r.status === 'skipped_duplicate') return `⏭ ${escapeHtml(r.order_id)} (already bound)`;
+            const hint = [r.inferred_part || 'unknown part', r.inferred_model].filter(Boolean).join(', ');
+            return `❌ ${escapeHtml((r.product_name || '').slice(0, 40))}… — no match (${escapeHtml(hint)})`;
+        });
+        const llmNote = data.llm_match_count ? `, LLM ${data.llm_match_count}` : '';
+        const unmatched = data.unmatched_count || 0;
+        lastImportUnmatched = unmatched;
+        resultsEl.innerHTML = `<p class="font-semibold mb-2">Matched ${data.matched_count}, updated ${data.updated_count || 0} of ${data.total_rows} rows${llmNote}${unmatched ? `, ${unmatched} unmatched` : ''}</p>${lines.map((l) => `<div class="py-1 border-b border-gray-200 last:border-0">${l}</div>`).join('')}`;
+        llmBtn.disabled = !lastImportBatchId || unmatched <= 0;
+    }
+
     document.getElementById('btn-taobao-upload').addEventListener('click', async () => {
         const fileInput = document.getElementById('taobao-file');
-        const resultsEl = document.getElementById('taobao-results');
         if (!fileInput.files || !fileInput.files[0]) {
             alert('Choose an .xlsx file first');
             return;
@@ -950,25 +1087,44 @@ document.addEventListener('DOMContentLoaded', () => {
             if (!res.ok) throw new Error(data.message || 'Import failed');
             await loadInventory();
             if (selectedDeviceId) await loadJobsForDevice(selectedDeviceId);
-            resultsEl.classList.remove('hidden');
-            const lines = (data.results || []).map((r) => {
-                if (r.status === 'matched') {
-                    const jobs = (r.matched_jobs || []).map((m) => `#${m.inventory_id} ${m.part_name}`).join(', ');
-                    return `✅ New: ${escapeHtml(r.product_name.slice(0, 40))}… → ${jobs}`;
-                }
-                if (r.status === 'updated') {
-                    const jobs = (r.updated_bindings || []).map((m) => `#${m.inventory_id} ${m.part_name}`).join(', ');
-                    return `🔄 Updated: ${escapeHtml(r.order_id)} → ${jobs}`;
-                }
-                if (r.status === 'skipped_duplicate') return `⏭ ${escapeHtml(r.order_id)} (already bound)`;
-                return `❌ ${escapeHtml(r.product_name.slice(0, 40))}… — no match (${escapeHtml(r.inferred_part || 'unknown part')})`;
-            });
-            resultsEl.innerHTML = `<p class="font-semibold mb-2">Matched ${data.matched_count}, updated ${data.updated_count || 0} of ${data.total_rows} rows</p>${lines.map((l) => `<div class="py-1 border-b border-gray-200 last:border-0">${l}</div>`).join('')}`;
+            renderTaobaoResults(data);
         } catch (err) {
             alert(err.message || 'Import failed');
         } finally {
             btn.disabled = false;
             btn.textContent = 'Upload & Match';
+        }
+    });
+
+    document.getElementById('btn-taobao-llm').addEventListener('click', async () => {
+        if (!lastImportBatchId) {
+            alert('Upload a sheet first.');
+            return;
+        }
+        const btn = document.getElementById('btn-taobao-llm');
+        btn.disabled = true;
+        btn.textContent = 'Matching with LLM…';
+        try {
+            const res = await fetch(`/api/taobao/import/${encodeURIComponent(lastImportBatchId)}/llm-match`, {
+                method: 'POST',
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                if (res.status === 400 && /settings/i.test(data.message || '')) {
+                    alert(data.message || 'Configure the LLM API in Settings first.');
+                    document.getElementById('btn-settings').click();
+                    return;
+                }
+                throw new Error(data.message || 'LLM matching failed');
+            }
+            await loadInventory();
+            if (selectedDeviceId) await loadJobsForDevice(selectedDeviceId);
+            renderTaobaoResults(data);
+        } catch (err) {
+            alert(err.message || 'LLM matching failed');
+        } finally {
+            btn.disabled = !lastImportBatchId || lastImportUnmatched <= 0;
+            btn.textContent = 'Retry unmatched with LLM';
         }
     });
 

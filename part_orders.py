@@ -66,18 +66,33 @@ def find_existing_bindings(
     variant: str,
 ) -> list[dict[str, Any]]:
     """Find part_orders already bound to this Taobao order line (stable across re-imports)."""
-    rows = conn.execute(
-        """
-        SELECT po.*, j.title AS job_title, i.model AS device_model
-        FROM part_orders po
-        JOIN repair_jobs j ON j.id = po.repair_job_id
-        JOIN inventory i ON i.id = po.inventory_id
-        WHERE po.taobao_order_id = ?
-          AND po.product_name = ?
-        ORDER BY po.id ASC
-        """,
-        (order_id, product_name),
-    ).fetchall()
+    if variant:
+        rows = conn.execute(
+            """
+            SELECT po.*, j.title AS job_title, i.model AS device_model
+            FROM part_orders po
+            JOIN repair_jobs j ON j.id = po.repair_job_id
+            JOIN inventory i ON i.id = po.inventory_id
+            WHERE po.taobao_order_id = ?
+              AND po.product_name = ?
+              AND (po.variant = ? OR po.variant IS NULL OR po.variant = '')
+            ORDER BY po.id ASC
+            """,
+            (order_id, product_name, variant),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT po.*, j.title AS job_title, i.model AS device_model
+            FROM part_orders po
+            JOIN repair_jobs j ON j.id = po.repair_job_id
+            JOIN inventory i ON i.id = po.inventory_id
+            WHERE po.taobao_order_id = ?
+              AND po.product_name = ?
+            ORDER BY po.id ASC
+            """,
+            (order_id, product_name),
+        ).fetchall()
     return [_row_dict(r) for r in rows]
 
 
