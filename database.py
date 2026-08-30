@@ -37,6 +37,67 @@ def init_db():
         cursor.execute("ALTER TABLE inventory ADD COLUMN inventory_number TEXT")
         conn.commit()
 
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS purchase_orders (
+        order_no TEXT PRIMARY KEY,
+        submit_time TEXT,
+        status TEXT DEFAULT 'paid',
+        shop_name TEXT,
+        order_total REAL,
+        shipping_fee REAL,
+        logistics_company TEXT,
+        tracking_no TEXT,
+        imported_at TEXT
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS purchase_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_no TEXT NOT NULL REFERENCES purchase_orders(order_no) ON DELETE CASCADE,
+        item_title TEXT NOT NULL,
+        item_link TEXT,
+        sku_text TEXT,
+        quantity INTEGER DEFAULT 1,
+        unit_price REAL,
+        category TEXT DEFAULT 'unknown',
+        part_type TEXT,
+        models TEXT DEFAULT '[]',
+        confidence REAL,
+        classified_by TEXT,
+        review_status TEXT DEFAULT 'pending',
+        notes TEXT,
+        UNIQUE(order_no, item_title, sku_text)
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS item_device_links (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        purchase_item_id INTEGER NOT NULL REFERENCES purchase_items(id) ON DELETE CASCADE,
+        inventory_id INTEGER NOT NULL REFERENCES inventory(id) ON DELETE CASCADE,
+        qty INTEGER DEFAULT 1,
+        created_at TEXT,
+        UNIQUE(purchase_item_id, inventory_id)
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS llm_classify_cache (
+        cache_key TEXT PRIMARY KEY,
+        result TEXT,
+        created_at TEXT
+    )
+    ''')
+
+    conn.commit()
     conn.close()
     print("Database initialized.")
 

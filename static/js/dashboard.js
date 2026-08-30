@@ -1,12 +1,14 @@
 document.addEventListener('DOMContentLoaded', () => {
     const tableBody = document.getElementById('inventory-body');
-    const partsSummaryBody = document.getElementById('parts-summary-body');
+    const partsSummaryList = document.getElementById('parts-summary-list');
     const partsSummaryCount = document.getElementById('parts-summary-count');
+    const partsHideOrdered = document.getElementById('parts-hide-ordered');
     const panelInventory = document.getElementById('panel-inventory');
     const panelParts = document.getElementById('panel-parts');
     const tabInventory = document.getElementById('tab-inventory');
     const tabParts = document.getElementById('tab-parts');
     const searchInput = document.getElementById('inventory-search');
+    const sortSelect = document.getElementById('inventory-sort');
     const searchStatus = document.getElementById('inventory-search-status');
     const modal = document.getElementById('detail-modal');
 
@@ -65,8 +67,21 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     let inventoryData = [];
+    let incomingByDevice = {};
     let currentItemId = null;
     let currentParts = [];
+
+    // How far along an order is, used to pick the most advanced status per part.
+    const ORDER_PROGRESS = { paid: 1, shipped: 2, received: 3 };
+
+    // Repair workflow states. `rank` drives the "Needs repair first" sort.
+    const REPAIR_STATES = {
+        ready: { label: 'Ready to fix', cls: 'bg-green-100 text-green-800', rank: 0 },
+        order: { label: 'Order parts', cls: 'bg-red-100 text-red-800', rank: 1 },
+        inbound: { label: 'Parts inbound', cls: 'bg-blue-100 text-blue-800', rank: 2 },
+        done: { label: 'No parts needed', cls: 'bg-gray-100 text-gray-500', rank: 3 },
+        blocked: { label: 'Excluded', cls: 'bg-gray-200 text-gray-600', rank: 4 },
+    };
 
     elements.commonPartsList.innerHTML = COMMON_PARTS
         .map((p) => `<option value="${escapeAttr(p)}"></option>`)
@@ -79,31 +94,93 @@ document.addEventListener('DOMContentLoaded', () => {
         </button>
     `).join('');
 
+    const panelPurchases = document.getElementById('panel-purchases');
+    const tabPurchases = document.getElementById('tab-purchases');
+
     function setActiveTab(tab) {
-        const inventoryActive = tab === 'inventory';
-        panelInventory.classList.toggle('hidden', !inventoryActive);
-        panelParts.classList.toggle('hidden', inventoryActive);
-
-        tabInventory.classList.toggle('border-blue-600', inventoryActive);
-        tabInventory.classList.toggle('text-blue-700', inventoryActive);
-        tabInventory.classList.toggle('border-transparent', !inventoryActive);
-        tabInventory.classList.toggle('text-gray-500', !inventoryActive);
-
-        tabParts.classList.toggle('border-blue-600', !inventoryActive);
-        tabParts.classList.toggle('text-blue-700', !inventoryActive);
-        tabParts.classList.toggle('border-transparent', inventoryActive);
-        tabParts.classList.toggle('text-gray-500', inventoryActive);
+        const tabs = [
+            { name: 'inventory', btn: tabInventory, panel: panelInventory },
+            { name: 'parts', btn: tabParts, panel: panelParts },
+            { name: 'purchases', btn: tabPurchases, panel: panelPurchases },
+        ];
+        tabs.forEach(({ name, btn, panel }) => {
+            const active = name === tab;
+            panel.classList.toggle('hidden', !active);
+            btn.classList.toggle('border-blue-600', active);
+            btn.classList.toggle('text-blue-700', active);
+            btn.classList.toggle('border-transparent', !active);
+            btn.classList.toggle('text-gray-500', !active);
+        });
+        if (tab === 'purchases') loadPurchases();
     }
 
     async function loadInventory() {
         try {
-            const res = await fetch('/api/inventory');
+            const [res] = await Promise.all([fetch('/api/inventory'), loadIncomingParts()]);
             inventoryData = await res.json();
             renderTable();
             renderPartsSummary();
         } catch (error) {
             console.error('Error fetching inventory:', error);
             tableBody.innerHTML = `<tr><td colspan="6" class="px-6 py-4 text-center text-sm text-red-500">Failed to load inventory.</td></tr>`;
+        }
+    }
+
+    async function loadIncomingParts() {
+        try {
+            const res = await fetch('/api/inventory/incoming-parts');
+            incomingByDevice = await res.json();
+        } catch (error) {
+            console.error('Error fetching incoming parts:', error);
+            incomingByDevice = {};
+        }
+    }
+
+    /** Part names already covered by an order for this device -> order status. */
+    function coveredParts(deviceId) {
+        const covered = new Map();
+        (incomingByDevice[deviceId] || []).forEach((incoming) => {
+            if (!incoming.part_name) return;
+            const previous = covered.get(incoming.part_name);
+            const better = (ORDER_PROGRESS[incoming.order_status] || 0)
+                > (ORDER_PROGRESS[previous] || 0);
+            if (!previous || better) covered.set(incoming.part_name, incoming.order_status);
+        });
+        return covered;
+    }
+
+    function repairState(item) {
+        if (isBlockedLock(item.lock_status, item)) return 'blocked';
+        const parts = parseParts(item.parts_needed);
+        if (parts.length === 0) return 'done';
+        const covered = coveredParts(item.id);
+        if (parts.some((part) => !covered.has(part))) return 'order';
+        return parts.every((part) => covered.get(part) === 'received') ? 'ready' : 'inbound';
+    }
+
+    function sortInventory(items) {
+        const list = items.slice();
+        const newestFirst = (a, b) => b.id - a.id;
+
+        switch (sortSelect.value) {
+            case 'newest':
+                return list.sort(newestFirst);
+            case 'oldest':
+                return list.sort((a, b) => a.id - b.id);
+            case 'model':
+                return list.sort((a, b) =>
+                    String(a.model || '').localeCompare(String(b.model || '')) || newestFirst(a, b));
+            case 'parts':
+                return list.sort((a, b) =>
+                    parseParts(b.parts_needed).length - parseParts(a.parts_needed).length
+                    || newestFirst(a, b));
+            default:
+                return list.sort((a, b) => {
+                    const rankDiff = REPAIR_STATES[repairState(a)].rank - REPAIR_STATES[repairState(b)].rank;
+                    if (rankDiff !== 0) return rankDiff;
+                    const partsDiff = parseParts(b.parts_needed).length - parseParts(a.parts_needed).length;
+                    return partsDiff || newestFirst(a, b);
+                });
         }
     }
 
@@ -126,7 +203,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function renderTable() {
-        const items = filteredInventory();
+        const items = sortInventory(filteredInventory());
         const query = searchInput.value.trim();
         if (query) {
             searchStatus.classList.remove('hidden');
@@ -151,6 +228,7 @@ document.addEventListener('DOMContentLoaded', () => {
         tableBody.innerHTML = items.map((item) => {
             const blocked = isBlockedLock(item.lock_status, item);
             const parts = parseParts(item.parts_needed);
+            const state = REPAIR_STATES[repairState(item)];
             const partsStr = blocked
                 ? 'Excluded'
                 : (parts.length > 0 ? parts.join(', ') : 'None');
@@ -163,29 +241,32 @@ document.addEventListener('DOMContentLoaded', () => {
 
             return `
                 <tr class="${rowClass}" data-id="${item.id}">
-                    <td class="px-6 py-4 whitespace-nowrap text-sm ${blocked ? 'text-red-700' : 'text-gray-500'}">
+                    <td class="px-3 py-4 whitespace-nowrap text-sm ${blocked ? 'text-red-700' : 'text-gray-500'}">
                         #${item.id}<br><span class="text-xs ${blocked ? 'text-red-400' : 'text-gray-400'}">${item.date_received || ''}</span>
                     </td>
-                    <td class="px-6 py-4 whitespace-nowrap">
+                    <td class="px-3 py-4">
                         <div class="text-sm font-medium ${blocked ? 'text-red-900' : 'text-gray-900'}">${escapeHtml(item.model || 'Unknown')}</div>
-                        <div class="text-sm ${blocked ? 'text-red-700' : 'text-gray-500'}">${item.inventory_number ? '#' + escapeHtml(item.inventory_number) + ' · ' : ''}${escapeHtml(item.color || '')} ${escapeHtml(item.capacity || '')} ${item.vision_device_type ? '· ' + escapeHtml(item.vision_device_type) : ''}</div>
+                        <div class="text-xs ${blocked ? 'text-red-700' : 'text-gray-500'}">${item.inventory_number ? '#' + escapeHtml(item.inventory_number) + ' · ' : ''}${escapeHtml(item.color || '')} ${escapeHtml(item.capacity || '')} ${item.vision_device_type ? '· ' + escapeHtml(item.vision_device_type) : ''}</div>
                     </td>
-                    <td class="px-6 py-4 whitespace-nowrap text-sm ${blocked ? 'text-red-700' : 'text-gray-500'}">
-                        S/N: ${escapeHtml(item.serial_number || 'N/A')}<br>
-                        IMEI: ${escapeHtml(item.imei || 'N/A')}
+                    <td class="px-3 py-4 whitespace-nowrap text-xs ${blocked ? 'text-red-700' : 'text-gray-500'}">
+                        ${escapeHtml(item.serial_number || 'N/A')}<br>
+                        ${escapeHtml(item.imei || 'N/A')}
                     </td>
-                    <td class="px-6 py-4 whitespace-nowrap">
+                    <td class="px-3 py-4">
                         <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${lockClass}">
                             ${escapeHtml(item.lock_status || 'Unknown')}
                         </span>
                     </td>
-                    <td class="px-6 py-4 whitespace-nowrap">
+                    <td class="px-3 py-4">
                         <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-yellow-100 text-yellow-800">
                             ${escapeHtml(item.damage_condition || 'Unknown')}
                         </span>
                     </td>
-                    <td class="px-6 py-4 text-sm ${blocked ? 'text-red-600 italic' : 'text-gray-500'} truncate max-w-xs">
-                        ${escapeHtml(partsStr)}
+                    <td class="px-3 py-4 text-sm ${blocked ? 'text-red-600 italic' : 'text-gray-500'} max-w-xs">
+                        <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${state.cls}">
+                            ${escapeHtml(state.label)}
+                        </span>
+                        <div class="truncate mt-1 text-xs">${escapeHtml(partsStr)}</div>
                     </td>
                 </tr>
             `;
@@ -200,49 +281,179 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    function renderPartsSummary() {
-        const aggregates = new Map();
+    /**
+     * Group every needed part by model so the result reads as a purchase list:
+     * "Replacement Battery -> 3x iPhone 7, 2x iPhone 11". Parts already covered
+     * by an order are counted separately so they don't get bought twice.
+     */
+    function buildShoppingList() {
+        const parts = new Map();
 
         inventoryData.forEach((item) => {
             if (isBlockedLock(item.lock_status, item)) return;
-            const parts = parseParts(item.parts_needed);
-            const deviceLabel = `#${item.id} ${item.model || 'Unknown'}`.trim();
-            parts.forEach((part) => {
-                const key = part.trim();
-                if (!key) return;
-                if (!aggregates.has(key)) {
-                    aggregates.set(key, { part: key, qty: 0, devices: [] });
+            const covered = coveredParts(item.id);
+
+            parseParts(item.parts_needed).forEach((raw) => {
+                const part = String(raw).trim();
+                if (!part) return;
+                if (!parts.has(part)) parts.set(part, new Map());
+
+                const models = parts.get(part);
+                const label = String(item.model || '').trim() || 'Unknown model';
+                const key = label.toLowerCase().replace(/\s+/g, ' ');
+                if (!models.has(key)) {
+                    models.set(key, { label, toOrder: 0, ordered: 0, toOrderIds: [], orderedIds: [] });
                 }
-                const entry = aggregates.get(key);
-                entry.qty += 1;
-                entry.devices.push(deviceLabel);
+
+                const entry = models.get(key);
+                if (covered.has(part)) {
+                    entry.ordered += 1;
+                    entry.orderedIds.push(item.id);
+                } else {
+                    entry.toOrder += 1;
+                    entry.toOrderIds.push(item.id);
+                }
             });
         });
 
-        const rows = Array.from(aggregates.values()).sort((a, b) => {
-            if (b.qty !== a.qty) return b.qty - a.qty;
-            return a.part.localeCompare(b.part);
-        });
+        return Array.from(parts.entries()).map(([part, models]) => {
+            const rows = Array.from(models.values()).sort((a, b) =>
+                (b.toOrder - a.toOrder) || (b.ordered - a.ordered) || a.label.localeCompare(b.label));
+            return {
+                part,
+                rows,
+                toOrder: rows.reduce((sum, row) => sum + row.toOrder, 0),
+                ordered: rows.reduce((sum, row) => sum + row.ordered, 0),
+            };
+        }).sort((a, b) => (b.toOrder - a.toOrder) || a.part.localeCompare(b.part));
+    }
 
-        const totalQty = rows.reduce((sum, row) => sum + row.qty, 0);
-        partsSummaryCount.textContent = rows.length
-            ? `${rows.length} part type${rows.length === 1 ? '' : 's'} · ${totalQty} total`
+    function renderPartsSummary() {
+        const hideOrdered = partsHideOrdered.checked;
+        const groups = buildShoppingList().filter((group) => !hideOrdered || group.toOrder > 0);
+
+        const totalToOrder = groups.reduce((sum, group) => sum + group.toOrder, 0);
+        const totalOrdered = groups.reduce((sum, group) => sum + group.ordered, 0);
+        partsSummaryCount.textContent = groups.length
+            ? `${groups.length} part type${groups.length === 1 ? '' : 's'} · ${totalToOrder} to order`
+                + (totalOrdered ? ` · ${totalOrdered} already ordered` : '')
             : '';
 
-        if (rows.length === 0) {
-            partsSummaryBody.innerHTML = `<tr><td colspan="3" class="px-6 py-4 text-center text-sm text-gray-500">No parts needed yet.</td></tr>`;
+        if (groups.length === 0) {
+            const message = hideOrdered && totalOrdered === 0 && inventoryData.length > 0
+                ? 'Nothing to order — every needed part is already on an order.'
+                : 'No parts needed yet.';
+            partsSummaryList.innerHTML = `<div class="px-6 py-6 text-center text-sm text-gray-500">${message}</div>`;
             return;
         }
 
-        partsSummaryBody.innerHTML = rows.map((row) => `
-            <tr>
-                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">${escapeHtml(row.part)}</td>
-                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                    <span class="inline-flex items-center justify-center min-w-[2rem] px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 text-xs font-semibold">${row.qty}</span>
-                </td>
-                <td class="px-6 py-4 text-sm text-gray-500">${escapeHtml(row.devices.join(', '))}</td>
-            </tr>
-        `).join('');
+        partsSummaryList.innerHTML = groups.map((group) => {
+            const rows = group.rows
+                .map((row) => renderShoppingRow(row, hideOrdered))
+                .filter(Boolean)
+                .join('');
+            return `
+                <div class="px-6 py-4">
+                    <div class="flex flex-wrap items-baseline gap-2 mb-2">
+                        <h4 class="text-base font-semibold text-gray-900">${escapeHtml(group.part)}</h4>
+                        <span class="inline-flex items-center px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 text-xs font-semibold">
+                            ${group.toOrder} to order
+                        </span>
+                        ${group.ordered ? `<span class="inline-flex items-center px-2 py-0.5 rounded-full bg-green-100 text-green-800 text-xs font-semibold">${group.ordered} ordered</span>` : ''}
+                        <button type="button" class="btn-copy-part ml-auto text-xs text-gray-500 hover:text-blue-700 underline"
+                            data-part="${escapeAttr(group.part)}">Copy</button>
+                    </div>
+                    <ul class="space-y-1">${rows}</ul>
+                </div>
+            `;
+        }).join('');
+    }
+
+    function renderShoppingRow(row, hideOrdered) {
+        const lines = [];
+        if (row.toOrder > 0) {
+            lines.push(`
+                <li class="flex flex-wrap items-baseline gap-2 text-sm">
+                    <span class="font-semibold text-gray-900 tabular-nums">${row.toOrder}×</span>
+                    <span class="text-gray-800">${escapeHtml(row.label)}</span>
+                    <span class="text-xs text-gray-400">${row.toOrderIds.map((id) => '#' + id).join(' ')}</span>
+                </li>`);
+        }
+        if (!hideOrdered && row.ordered > 0) {
+            lines.push(`
+                <li class="flex flex-wrap items-baseline gap-2 text-sm">
+                    <span class="font-semibold text-gray-400 tabular-nums">${row.ordered}×</span>
+                    <span class="text-gray-400 line-through">${escapeHtml(row.label)}</span>
+                    <span class="text-xs text-green-700">already ordered</span>
+                    <span class="text-xs text-gray-400">${row.orderedIds.map((id) => '#' + id).join(' ')}</span>
+                </li>`);
+        }
+        return lines.join('');
+    }
+
+    /** Plain-text version of the list, ready to paste into a shop search or notes. */
+    function shoppingListText(onlyPart) {
+        return buildShoppingList()
+            .filter((group) => group.toOrder > 0 && (!onlyPart || group.part === onlyPart))
+            .map((group) => {
+                const lines = group.rows
+                    .filter((row) => row.toOrder > 0)
+                    .map((row) => `  ${row.toOrder}x ${row.label}`);
+                return `${group.part}\n${lines.join('\n')}`;
+            })
+            .join('\n\n');
+    }
+
+    /**
+     * The async clipboard API is unavailable over plain HTTP (e.g. opening the
+     * dashboard from a phone on the LAN), so fall back to a hidden textarea.
+     */
+    async function writeToClipboard(text) {
+        try {
+            if (navigator.clipboard && window.isSecureContext) {
+                await navigator.clipboard.writeText(text);
+                return true;
+            }
+        } catch (error) {
+            console.warn('Clipboard API unavailable, falling back:', error);
+        }
+
+        const scratch = document.createElement('textarea');
+        scratch.value = text;
+        scratch.setAttribute('readonly', '');
+        scratch.style.position = 'fixed';
+        scratch.style.opacity = '0';
+        document.body.appendChild(scratch);
+        scratch.select();
+        let copied = false;
+        try {
+            copied = document.execCommand('copy');
+        } catch (error) {
+            console.error('Clipboard fallback failed:', error);
+        }
+        document.body.removeChild(scratch);
+        return copied;
+    }
+
+    async function copyShoppingList(onlyPart, button) {
+        const text = shoppingListText(onlyPart);
+        if (!text) return;
+
+        const fallback = document.getElementById('parts-copy-fallback');
+        const fallbackText = document.getElementById('parts-copy-text');
+        const original = button.textContent;
+
+        if (await writeToClipboard(text)) {
+            button.textContent = 'Copied';
+            fallback.classList.add('hidden');
+        } else {
+            button.textContent = 'Copy blocked';
+            fallbackText.value = text;
+            fallback.classList.remove('hidden');
+            fallbackText.focus();
+            fallbackText.select();
+        }
+        setTimeout(() => { button.textContent = original; }, 1200);
     }
 
     function isTablet(item) {
@@ -386,6 +597,31 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         modal.classList.remove('hidden');
+        renderIncomingPartsCard(item.id);
+    }
+
+    async function renderIncomingPartsCard(itemId) {
+        const card = document.getElementById('modal-incoming-parts-card');
+        const container = document.getElementById('modal-incoming-parts');
+        card.classList.add('hidden');
+        container.innerHTML = '';
+        try {
+            const res = await fetch(`/api/inventory/${itemId}/incoming-parts`);
+            const parts = await res.json();
+            if (!Array.isArray(parts) || parts.length === 0) return;
+            const statusLabel = { paid: 'ordered', shipped: 'shipped', received: 'received' };
+            container.innerHTML = parts.map((p) => `
+                <div class="flex items-start justify-between gap-2">
+                    <span>${escapeHtml(p.sku_text || p.item_title)}${p.qty > 1 ? ` ×${p.qty}` : ''}</span>
+                    <span class="text-xs font-semibold whitespace-nowrap ${p.order_status === 'received' ? 'text-green-700' : 'text-blue-700'}">
+                        ${escapeHtml(statusLabel[p.order_status] || p.order_status || '')}${p.tracking_no ? ` · ${escapeHtml(p.tracking_no)}` : ''}
+                    </span>
+                </div>
+            `).join('');
+            card.classList.remove('hidden');
+        } catch (error) {
+            console.error('Failed to load incoming parts:', error);
+        }
     }
 
     function closeModal() {
@@ -479,6 +715,325 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    // ---- Purchases tab ----
+
+    const purchasesList = document.getElementById('purchases-list');
+    const purchaseFilesInput = document.getElementById('purchase-files');
+    const btnImportPurchases = document.getElementById('btn-import-purchases');
+    const btnClassifyPurchases = document.getElementById('btn-classify-purchases');
+    const purchaseFilter = document.getElementById('purchase-filter');
+    const purchaseStatus = document.getElementById('purchase-status');
+    const llmSettingsCard = document.getElementById('llm-settings-card');
+    const llmBaseUrl = document.getElementById('llm-base-url');
+    const llmModel = document.getElementById('llm-model');
+    const llmApiKey = document.getElementById('llm-api-key');
+    const llmSettingsStatus = document.getElementById('llm-settings-status');
+
+    let purchasesData = { items: [], categories: [], part_types: [] };
+    let llmSettingsLoaded = false;
+
+    const ORDER_STATUS_STYLE = {
+        paid: 'bg-yellow-100 text-yellow-800',
+        shipped: 'bg-blue-100 text-blue-800',
+        received: 'bg-green-100 text-green-800',
+    };
+    const CATEGORY_STYLE = {
+        part: 'bg-green-100 text-green-800',
+        service: 'bg-purple-100 text-purple-800',
+        tool: 'bg-orange-100 text-orange-800',
+        accessory: 'bg-blue-100 text-blue-800',
+        personal: 'bg-gray-200 text-gray-700',
+        unknown: 'bg-gray-100 text-gray-500',
+    };
+
+    function showPurchaseStatus(message, isError = false) {
+        purchaseStatus.classList.remove('hidden');
+        purchaseStatus.textContent = message;
+        purchaseStatus.classList.toggle('text-red-600', isError);
+        purchaseStatus.classList.toggle('text-gray-500', !isError);
+    }
+
+    async function loadPurchases() {
+        try {
+            const filter = purchaseFilter.value;
+            const url = filter ? `/api/purchases?review_status=${filter}` : '/api/purchases';
+            const res = await fetch(url);
+            purchasesData = await res.json();
+            renderPurchases();
+        } catch (error) {
+            console.error('Error fetching purchases:', error);
+            purchasesList.innerHTML = `<div class="bg-white shadow rounded-lg p-6 text-center text-sm text-red-500">Failed to load purchases.</div>`;
+        }
+    }
+
+    function renderPurchases() {
+        const items = purchasesData.items || [];
+        if (items.length === 0) {
+            purchasesList.innerHTML = `<div class="bg-white shadow rounded-lg p-6 text-center text-sm text-gray-500">No purchases${purchaseFilter.value ? ' with this status' : ' imported yet. Upload the Taobao xlsx exports above'}.</div>`;
+            return;
+        }
+
+        const orders = new Map();
+        items.forEach((item) => {
+            if (!orders.has(item.order_no)) {
+                orders.set(item.order_no, { meta: item, items: [] });
+            }
+            orders.get(item.order_no).items.push(item);
+        });
+
+        purchasesList.innerHTML = Array.from(orders.values()).map(({ meta, items: orderItems }) => {
+            const statusClass = ORDER_STATUS_STYLE[meta.order_status] || 'bg-gray-100 text-gray-600';
+            const logistics = meta.tracking_no
+                ? `<span class="text-xs text-gray-500">${escapeHtml(meta.logistics_company || '')} ${escapeHtml(meta.tracking_no)}</span>`
+                : '';
+            return `
+                <div class="bg-white shadow rounded-lg overflow-hidden">
+                    <div class="px-4 py-3 bg-gray-50 border-b border-gray-200 flex flex-wrap items-center gap-3">
+                        <span class="text-sm font-semibold text-gray-800">${escapeHtml(meta.shop_name || 'Unknown shop')}</span>
+                        <span class="px-2 py-0.5 rounded-full text-xs font-semibold ${statusClass}">${escapeHtml(meta.order_status || '')}</span>
+                        ${logistics}
+                        <span class="ml-auto text-xs text-gray-400">${escapeHtml(meta.submit_time || '')} · #${escapeHtml(meta.order_no)}</span>
+                    </div>
+                    <div class="divide-y divide-gray-100">
+                        ${orderItems.map(renderPurchaseItem).join('')}
+                    </div>
+                </div>
+            `;
+        }).join('');
+    }
+
+    function renderPurchaseItem(item) {
+        const categories = purchasesData.categories || [];
+        const partTypes = purchasesData.part_types || [];
+        const isPart = item.category === 'part';
+        const catClass = CATEGORY_STYLE[item.category] || CATEGORY_STYLE.unknown;
+        const dimmed = item.review_status === 'dismissed' ? 'opacity-50' : '';
+
+        const categoryOptions = categories.map((c) =>
+            `<option value="${escapeAttr(c)}" ${c === item.category ? 'selected' : ''}>${escapeHtml(c)}</option>`).join('');
+        const partTypeOptions = ['<option value="">—</option>'].concat(partTypes.map((p) =>
+            `<option value="${escapeAttr(p)}" ${p === item.part_type ? 'selected' : ''}>${escapeHtml(p)}</option>`)).join('');
+
+        const confidence = item.confidence != null && item.classified_by === 'llm'
+            ? `<span class="text-xs ${item.confidence >= 0.8 ? 'text-green-600' : 'text-orange-500'}">LLM ${Math.round(item.confidence * 100)}%</span>`
+            : (item.classified_by === 'manual' ? '<span class="text-xs text-blue-500">manual</span>' : '');
+
+        const links = (item.links || []).map((link) => `
+            <span class="inline-flex items-center gap-1 bg-green-50 border border-green-200 text-green-800 text-xs px-2 py-1 rounded-full">
+                Linked: #${link.inventory_id} ${escapeHtml(link.model || '')}${link.qty > 1 ? ` ×${link.qty}` : ''}
+                <button type="button" class="btn-unlink text-green-600 hover:text-red-600 font-bold" data-item="${item.id}" data-link="${link.link_id}" title="Remove link">×</button>
+            </span>
+        `).join('');
+
+        const suggestions = (item.suggestions || []).map((s) => `
+            <button type="button" class="btn-link-device inline-flex items-center gap-1 bg-blue-50 border border-blue-200 text-blue-800 hover:bg-blue-100 text-xs px-2 py-1 rounded-full"
+                data-item="${item.id}" data-device="${s.inventory_id}">
+                + Link #${s.inventory_id} ${escapeHtml(s.model || '')}${s.inventory_number ? ` (Inv ${escapeHtml(s.inventory_number)})` : ''} — ${escapeHtml(s.part_name)}
+            </button>
+        `).join('');
+
+        const reviewButtons = `
+            <div class="flex gap-1">
+                ${item.review_status !== 'confirmed'
+                    ? `<button type="button" class="btn-review text-xs px-2 py-1 rounded border border-green-300 text-green-700 hover:bg-green-50" data-item="${item.id}" data-status="confirmed">Confirm</button>`
+                    : `<button type="button" class="btn-review text-xs px-2 py-1 rounded bg-green-600 text-white" data-item="${item.id}" data-status="pending">Confirmed ✓</button>`}
+                ${item.review_status !== 'dismissed'
+                    ? `<button type="button" class="btn-review text-xs px-2 py-1 rounded border border-gray-300 text-gray-500 hover:bg-gray-50" data-item="${item.id}" data-status="dismissed">Dismiss</button>`
+                    : `<button type="button" class="btn-review text-xs px-2 py-1 rounded bg-gray-500 text-white" data-item="${item.id}" data-status="pending">Dismissed ↩</button>`}
+            </div>
+        `;
+
+        return `
+            <div class="px-4 py-3 ${dimmed}" data-item-row="${item.id}">
+                <div class="flex flex-wrap items-start gap-3">
+                    <div class="flex-1 min-w-[16rem]">
+                        <div class="text-sm text-gray-800">${escapeHtml(item.item_title)}</div>
+                        <div class="text-xs text-gray-500 mt-0.5">${escapeHtml(item.sku_text || '')}</div>
+                        <div class="text-xs text-gray-400 mt-0.5">×${item.quantity}${item.unit_price != null ? ` · ¥${item.unit_price}` : ''}</div>
+                    </div>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <span class="px-2 py-0.5 rounded-full text-xs font-semibold ${catClass}">${escapeHtml(item.category)}</span>
+                        ${confidence}
+                        <select class="sel-category border border-gray-300 rounded px-2 py-1 text-xs bg-white" data-item="${item.id}">${categoryOptions}</select>
+                        <select class="sel-part-type border border-gray-300 rounded px-2 py-1 text-xs bg-white ${isPart ? '' : 'hidden'}" data-item="${item.id}">${partTypeOptions}</select>
+                        <input type="text" class="inp-models border border-gray-300 rounded px-2 py-1 text-xs w-40 ${isPart ? '' : 'hidden'}" data-item="${item.id}"
+                            value="${escapeAttr((item.models || []).join(', '))}" placeholder="Models, e.g. iPhone 11">
+                        ${reviewButtons}
+                    </div>
+                </div>
+                ${item.notes ? `<div class="text-xs text-gray-400 italic mt-1">${escapeHtml(item.notes)}</div>` : ''}
+                ${(links || suggestions) ? `<div class="flex flex-wrap gap-2 mt-2">${links}${suggestions}</div>` : ''}
+            </div>
+        `;
+    }
+
+    async function patchPurchaseItem(itemId, payload) {
+        const res = await fetch(`/api/purchases/items/${itemId}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const result = await res.json();
+        if (!res.ok) throw new Error(result.message || 'Update failed');
+        await loadPurchases();
+    }
+
+    async function importPurchases() {
+        const files = purchaseFilesInput.files;
+        if (!files || files.length === 0) {
+            showPurchaseStatus('Choose one or more .xlsx files first.', true);
+            return;
+        }
+        const formData = new FormData();
+        Array.from(files).forEach((f) => formData.append('files', f));
+
+        btnImportPurchases.disabled = true;
+        btnImportPurchases.textContent = 'Importing...';
+        try {
+            const res = await fetch('/api/purchases/import', { method: 'POST', body: formData });
+            const result = await res.json();
+            const parts = (result.files || []).map((f) => f.success
+                ? `${f.filename}: ${f.items_new} new, ${f.items_skipped} existing, ${f.orders_updated} orders updated`
+                : `${f.filename}: FAILED (${f.message})`);
+            showPurchaseStatus(parts.join(' | '), !result.success);
+            purchaseFilesInput.value = '';
+            await loadPurchases();
+        } catch (error) {
+            showPurchaseStatus(error.message || 'Import failed', true);
+        } finally {
+            btnImportPurchases.disabled = false;
+            btnImportPurchases.textContent = 'Import';
+        }
+    }
+
+    async function classifyPurchases() {
+        btnClassifyPurchases.disabled = true;
+        btnClassifyPurchases.textContent = 'Classifying...';
+        try {
+            const res = await fetch('/api/purchases/classify', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+            });
+            const result = await res.json();
+            if (result.error) {
+                showPurchaseStatus(`Classified ${result.from_llm + result.from_cache}/${result.total} — ${result.error}`, true);
+            } else if (result.total === 0) {
+                showPurchaseStatus('Nothing to classify — all items already have a category.');
+            } else {
+                showPurchaseStatus(`Classified ${result.total} item${result.total === 1 ? '' : 's'} (${result.from_llm} via LLM, ${result.from_cache} from cache).`);
+            }
+            await loadPurchases();
+        } catch (error) {
+            showPurchaseStatus(error.message || 'Classification failed', true);
+        } finally {
+            btnClassifyPurchases.disabled = false;
+            btnClassifyPurchases.textContent = 'Classify with LLM';
+        }
+    }
+
+    async function loadLlmSettings() {
+        if (llmSettingsLoaded) return;
+        try {
+            const res = await fetch('/api/settings/llm');
+            const settings = await res.json();
+            llmBaseUrl.value = settings.llm_base_url || '';
+            llmModel.value = settings.llm_model || '';
+            llmApiKey.placeholder = settings.llm_api_key_set ? '••••••••  (saved — type to replace)' : 'sk-...';
+            llmSettingsLoaded = true;
+        } catch (error) {
+            llmSettingsStatus.textContent = 'Failed to load settings';
+        }
+    }
+
+    async function saveLlmSettings() {
+        llmSettingsStatus.textContent = 'Saving...';
+        try {
+            const payload = {
+                llm_base_url: llmBaseUrl.value.trim(),
+                llm_model: llmModel.value.trim(),
+            };
+            if (llmApiKey.value.trim()) payload.llm_api_key = llmApiKey.value.trim();
+            const res = await fetch('/api/settings/llm', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            const result = await res.json();
+            if (!res.ok) throw new Error(result.message || 'Save failed');
+            llmApiKey.value = '';
+            llmSettingsLoaded = false;
+            await loadLlmSettings();
+            llmSettingsStatus.textContent = result.configured ? 'Saved — configured.' : 'Saved, but base URL/model still missing.';
+        } catch (error) {
+            llmSettingsStatus.textContent = error.message || 'Save failed';
+        }
+    }
+
+    async function testLlmSettings() {
+        llmSettingsStatus.textContent = 'Testing...';
+        try {
+            const res = await fetch('/api/settings/llm/test', { method: 'POST' });
+            const result = await res.json();
+            llmSettingsStatus.textContent = result.message || (result.success ? 'OK' : 'Failed');
+        } catch (error) {
+            llmSettingsStatus.textContent = error.message || 'Test failed';
+        }
+    }
+
+    purchasesList.addEventListener('change', async (e) => {
+        const itemId = parseInt(e.target.dataset.item, 10);
+        if (Number.isNaN(itemId)) return;
+        try {
+            if (e.target.classList.contains('sel-category')) {
+                await patchPurchaseItem(itemId, { category: e.target.value });
+            } else if (e.target.classList.contains('sel-part-type')) {
+                await patchPurchaseItem(itemId, { part_type: e.target.value || null });
+            } else if (e.target.classList.contains('inp-models')) {
+                await patchPurchaseItem(itemId, { models: e.target.value });
+            }
+        } catch (error) {
+            showPurchaseStatus(error.message, true);
+        }
+    });
+
+    purchasesList.addEventListener('click', async (e) => {
+        const reviewBtn = e.target.closest('.btn-review');
+        const linkBtn = e.target.closest('.btn-link-device');
+        const unlinkBtn = e.target.closest('.btn-unlink');
+        try {
+            if (reviewBtn) {
+                await patchPurchaseItem(parseInt(reviewBtn.dataset.item, 10), { review_status: reviewBtn.dataset.status });
+            } else if (linkBtn) {
+                const res = await fetch(`/api/purchases/items/${linkBtn.dataset.item}/links`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ inventory_id: parseInt(linkBtn.dataset.device, 10), qty: 1 }),
+                });
+                const result = await res.json();
+                if (!res.ok) throw new Error(result.message || 'Link failed');
+                await Promise.all([loadPurchases(), loadInventory()]);
+            } else if (unlinkBtn) {
+                const res = await fetch(`/api/purchases/items/${unlinkBtn.dataset.item}/links/${unlinkBtn.dataset.link}`, { method: 'DELETE' });
+                const result = await res.json();
+                if (!res.ok) throw new Error(result.message || 'Unlink failed');
+                await Promise.all([loadPurchases(), loadInventory()]);
+            }
+        } catch (error) {
+            showPurchaseStatus(error.message, true);
+        }
+    });
+
+    btnImportPurchases.addEventListener('click', importPurchases);
+    btnClassifyPurchases.addEventListener('click', classifyPurchases);
+    purchaseFilter.addEventListener('change', loadPurchases);
+    document.getElementById('btn-toggle-llm-settings').addEventListener('click', () => {
+        llmSettingsCard.classList.toggle('hidden');
+        if (!llmSettingsCard.classList.contains('hidden')) loadLlmSettings();
+    });
+    document.getElementById('btn-save-llm').addEventListener('click', saveLlmSettings);
+    document.getElementById('btn-test-llm').addEventListener('click', testLlmSettings);
+
     function escapeHtml(value) {
         return String(value)
             .replace(/&/g, '&amp;')
@@ -513,7 +1068,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
     tabInventory.addEventListener('click', () => setActiveTab('inventory'));
     tabParts.addEventListener('click', () => setActiveTab('parts'));
+    tabPurchases.addEventListener('click', () => setActiveTab('purchases'));
     searchInput.addEventListener('input', renderTable);
+    sortSelect.addEventListener('change', renderTable);
+    partsHideOrdered.addEventListener('change', renderPartsSummary);
+    document.getElementById('btn-copy-parts').addEventListener('click', (e) => {
+        copyShoppingList(null, e.currentTarget);
+    });
+    partsSummaryList.addEventListener('click', (e) => {
+        const btn = e.target.closest('.btn-copy-part');
+        if (btn) copyShoppingList(btn.dataset.part, btn);
+    });
     elements.lockStatus.addEventListener('change', () => styleLockSelect(elements.lockStatus));
     elements.model.addEventListener('input', () => {
         elements.title.innerText = elements.model.value.trim() || `Device #${currentItemId}`;

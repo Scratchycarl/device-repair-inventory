@@ -8,10 +8,22 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from PIL import Image, ImageEnhance, ImageFilter
 from pyzbar.pyzbar import decode as pyzbar_decode
+from datetime import datetime, timezone
 from database import init_db
 from vision import analyze_photos
 from repair_parts import determine_parts_needed as map_parts_needed
 from ocr_label import extract_label_fields, parse_comma_payload
+from taobao_xlsx import parse_taobao_xlsx, upsert_purchases
+from llm_classify import (
+    get_llm_settings,
+    save_llm_settings,
+    llm_configured,
+    test_llm_connection,
+    classify_items,
+    CATEGORIES,
+    PART_TYPES,
+)
+from matching import build_suggestions, incoming_parts_by_device
 
 app = Flask(__name__, static_folder='static')
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max upload
@@ -26,6 +38,7 @@ init_db()
 def get_db_connection():
     conn = sqlite3.connect('inventory.db')
     conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA foreign_keys = ON')
     return conn
 
 def analyze_damage_vision_api(front_image_path, back_image_path):
@@ -388,6 +401,285 @@ def delete_inventory(item_id):
     _delete_upload_file(item.get('back_image_url'))
 
     return jsonify({'success': True, 'message': 'Device deleted'})
+
+
+# ---- Purchases (Taobao import) ----
+
+@app.route('/api/purchases/import', methods=['POST'])
+def import_purchases():
+    """Import one or more Taobao xlsx exports (paid/shipped/received)."""
+    files = request.files.getlist('files') or request.files.getlist('file')
+    if not files:
+        return jsonify({'success': False, 'message': 'No files uploaded'}), 400
+
+    conn = get_db_connection()
+    results = []
+    any_ok = False
+    for f in files:
+        entry = {'filename': f.filename}
+        try:
+            rows = parse_taobao_xlsx(f.stream)
+            counts = upsert_purchases(conn, rows)
+            entry.update({'success': True, 'rows': len(rows), **counts})
+            any_ok = True
+        except Exception as exc:
+            entry.update({'success': False, 'message': str(exc)})
+        results.append(entry)
+    conn.close()
+
+    status = 200 if any_ok else 400
+    return jsonify({'success': any_ok, 'files': results}), status
+
+
+@app.route('/api/purchases/classify', methods=['POST'])
+def classify_purchases():
+    """Run LLM classification on unclassified items (or explicit item_ids)."""
+    data = request.json or {}
+    item_ids = data.get('item_ids')
+    conn = get_db_connection()
+    summary = classify_items(conn, item_ids=item_ids)
+    conn.close()
+    ok = summary.get('error') is None
+    return jsonify({'success': ok, **summary}), 200 if ok else 502
+
+
+@app.route('/api/purchases', methods=['GET'])
+def get_purchases():
+    review_status = request.args.get('review_status')
+    conn = get_db_connection()
+
+    query = '''
+        SELECT p.*, o.submit_time, o.status AS order_status, o.shop_name,
+               o.logistics_company, o.tracking_no
+        FROM purchase_items p
+        JOIN purchase_orders o ON o.order_no = p.order_no
+    '''
+    params = []
+    if review_status:
+        query += ' WHERE p.review_status = ?'
+        params.append(review_status)
+    query += ' ORDER BY o.submit_time DESC, p.order_no, p.id'
+
+    items = [dict(r) for r in conn.execute(query, params).fetchall()]
+
+    link_rows = conn.execute('''
+        SELECT l.id AS link_id, l.purchase_item_id, l.inventory_id, l.qty,
+               i.model, i.inventory_number, i.serial_number
+        FROM item_device_links l
+        JOIN inventory i ON i.id = l.inventory_id
+    ''').fetchall()
+    links_by_item = {}
+    for row in link_rows:
+        links_by_item.setdefault(row['purchase_item_id'], []).append(dict(row))
+
+    suggestions = build_suggestions(conn, items)
+    conn.close()
+
+    for item in items:
+        try:
+            item['models'] = json.loads(item.get('models') or '[]')
+        except (ValueError, TypeError):
+            item['models'] = []
+        item['links'] = links_by_item.get(item['id'], [])
+        item['suggestions'] = suggestions.get(item['id'], [])
+
+    return jsonify({
+        'items': items,
+        'categories': sorted(CATEGORIES),
+        'part_types': sorted(PART_TYPES),
+    })
+
+
+@app.route('/api/purchases/items/<int:item_id>', methods=['PATCH'])
+def update_purchase_item(item_id):
+    """Manual edits to classification / review status."""
+    data = request.json or {}
+    conn = get_db_connection()
+    row = conn.execute('SELECT id FROM purchase_items WHERE id = ?', (item_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Item not found'}), 404
+
+    fields = []
+    values = []
+    manual_edit = False
+
+    if 'category' in data:
+        category = str(data['category'] or 'unknown').strip().lower()
+        if category not in CATEGORIES:
+            conn.close()
+            return jsonify({'success': False, 'message': f'Invalid category: {category}'}), 400
+        fields.append('category = ?')
+        values.append(category)
+        manual_edit = True
+        if category != 'part':
+            fields.append('part_type = ?')
+            values.append(None)
+
+    if 'part_type' in data:
+        part_type = data['part_type']
+        if part_type is not None:
+            part_type = str(part_type).strip().lower() or None
+        if part_type is not None and part_type not in PART_TYPES:
+            conn.close()
+            return jsonify({'success': False, 'message': f'Invalid part_type: {part_type}'}), 400
+        fields.append('part_type = ?')
+        values.append(part_type)
+        manual_edit = True
+
+    if 'models' in data:
+        models = data['models']
+        if isinstance(models, str):
+            models = [m.strip() for m in models.split(',') if m.strip()]
+        if not isinstance(models, list):
+            conn.close()
+            return jsonify({'success': False, 'message': 'models must be a list'}), 400
+        fields.append('models = ?')
+        values.append(json.dumps([str(m).strip() for m in models], ensure_ascii=False))
+        manual_edit = True
+
+    if 'review_status' in data:
+        review = str(data['review_status'] or 'pending').strip().lower()
+        if review not in {'pending', 'confirmed', 'dismissed'}:
+            conn.close()
+            return jsonify({'success': False, 'message': f'Invalid review_status: {review}'}), 400
+        fields.append('review_status = ?')
+        values.append(review)
+
+    if manual_edit:
+        fields.append("classified_by = 'manual'")
+
+    if not fields:
+        conn.close()
+        return jsonify({'success': False, 'message': 'No updatable fields provided'}), 400
+
+    values.append(item_id)
+    conn.execute(f"UPDATE purchase_items SET {', '.join(fields)} WHERE id = ?", values)
+    conn.commit()
+    updated = dict(conn.execute('SELECT * FROM purchase_items WHERE id = ?', (item_id,)).fetchone())
+    conn.close()
+    try:
+        updated['models'] = json.loads(updated.get('models') or '[]')
+    except (ValueError, TypeError):
+        updated['models'] = []
+    return jsonify({'success': True, 'item': updated})
+
+
+@app.route('/api/purchases/items/<int:item_id>/links', methods=['POST'])
+def link_purchase_item(item_id):
+    """Allocate a purchased item to a device (confirmed by the user)."""
+    data = request.json or {}
+    inventory_id = data.get('inventory_id')
+    qty = max(1, int(data.get('qty') or 1))
+    if not inventory_id:
+        return jsonify({'success': False, 'message': 'inventory_id is required'}), 400
+
+    conn = get_db_connection()
+    item = conn.execute('SELECT * FROM purchase_items WHERE id = ?', (item_id,)).fetchone()
+    device = conn.execute('SELECT id FROM inventory WHERE id = ?', (inventory_id,)).fetchone()
+    if not item or not device:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Item or device not found'}), 404
+
+    allocated = conn.execute(
+        'SELECT COALESCE(SUM(qty), 0) FROM item_device_links WHERE purchase_item_id = ?',
+        (item_id,),
+    ).fetchone()[0]
+    if allocated + qty > (item['quantity'] or 1):
+        conn.close()
+        return jsonify({
+            'success': False,
+            'message': f'Only {(item["quantity"] or 1) - allocated} of this item left to allocate',
+        }), 400
+
+    try:
+        conn.execute(
+            'INSERT INTO item_device_links (purchase_item_id, inventory_id, qty, created_at) '
+            'VALUES (?, ?, ?, ?)',
+            (item_id, inventory_id, qty, datetime.now(timezone.utc).isoformat()),
+        )
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Already linked to this device'}), 409
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True}), 201
+
+
+@app.route('/api/purchases/items/<int:item_id>/links/<int:link_id>', methods=['DELETE'])
+def unlink_purchase_item(item_id, link_id):
+    conn = get_db_connection()
+    row = conn.execute(
+        'SELECT id FROM item_device_links WHERE id = ? AND purchase_item_id = ?',
+        (link_id, item_id),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Link not found'}), 404
+    conn.execute('DELETE FROM item_device_links WHERE id = ?', (link_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
+
+@app.route('/api/inventory/<int:item_id>/incoming-parts', methods=['GET'])
+def device_incoming_parts(item_id):
+    """Parts allocated to this device with their shipping status."""
+    conn = get_db_connection()
+    incoming = incoming_parts_by_device(conn, inventory_id=item_id)
+    conn.close()
+    return jsonify(incoming.get(item_id, []))
+
+
+@app.route('/api/inventory/incoming-parts', methods=['GET'])
+def all_incoming_parts():
+    """Allocated parts for every device, keyed by inventory id."""
+    conn = get_db_connection()
+    incoming = incoming_parts_by_device(conn)
+    conn.close()
+    return jsonify({str(device_id): parts for device_id, parts in incoming.items()})
+
+
+# ---- LLM settings ----
+
+@app.route('/api/settings/llm', methods=['GET'])
+def get_llm_settings_route():
+    conn = get_db_connection()
+    settings = get_llm_settings(conn)
+    conn.close()
+    return jsonify({
+        'llm_base_url': settings['llm_base_url'],
+        'llm_model': settings['llm_model'],
+        'llm_api_key_set': bool(settings['llm_api_key']),
+        'configured': llm_configured(settings),
+    })
+
+
+@app.route('/api/settings/llm', methods=['PUT'])
+def put_llm_settings_route():
+    data = request.json or {}
+    payload = {}
+    for key in ('llm_base_url', 'llm_model'):
+        if key in data:
+            payload[key] = data[key]
+    # Only overwrite the key when a non-empty value is sent, so the masked
+    # placeholder from the UI never wipes a stored key.
+    if data.get('llm_api_key'):
+        payload['llm_api_key'] = data['llm_api_key']
+    conn = get_db_connection()
+    save_llm_settings(conn, payload)
+    settings = get_llm_settings(conn)
+    conn.close()
+    return jsonify({'success': True, 'configured': llm_configured(settings)})
+
+
+@app.route('/api/settings/llm/test', methods=['POST'])
+def test_llm_settings_route():
+    conn = get_db_connection()
+    settings = get_llm_settings(conn)
+    conn.close()
+    ok, message = test_llm_connection(settings)
+    return jsonify({'success': ok, 'message': message}), 200 if ok else 502
 
 
 if __name__ == '__main__':
