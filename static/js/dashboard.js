@@ -10,6 +10,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const searchInput = document.getElementById('inventory-search');
     const sortSelect = document.getElementById('inventory-sort');
     const searchStatus = document.getElementById('inventory-search-status');
+    const showArchived = document.getElementById('show-archived');
     const modal = document.getElementById('detail-modal');
 
     const COMMON_PARTS = [
@@ -96,10 +97,26 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const panelPurchases = document.getElementById('panel-purchases');
     const tabPurchases = document.getElementById('tab-purchases');
+    const panelShipments = document.getElementById('panel-shipments');
+    const tabShipments = document.getElementById('tab-shipments');
+
+    function locationStatus(item) {
+        return item.location_status || 'in_storage';
+    }
+
+    function isInStorage(item) {
+        return locationStatus(item) === 'in_storage';
+    }
+
+    function isShippedOut(item) {
+        const status = locationStatus(item);
+        return status === 'in_transit' || status === 'archived';
+    }
 
     function setActiveTab(tab) {
         const tabs = [
             { name: 'inventory', btn: tabInventory, panel: panelInventory },
+            { name: 'shipments', btn: tabShipments, panel: panelShipments },
             { name: 'parts', btn: tabParts, panel: panelParts },
             { name: 'purchases', btn: tabPurchases, panel: panelPurchases },
         ];
@@ -112,6 +129,10 @@ document.addEventListener('DOMContentLoaded', () => {
             btn.classList.toggle('text-gray-500', !active);
         });
         if (tab === 'purchases') loadPurchases();
+        if (tab === 'shipments') {
+            renderShipmentPicker();
+            loadShipments();
+        }
     }
 
     async function loadInventory() {
@@ -120,6 +141,7 @@ document.addEventListener('DOMContentLoaded', () => {
             inventoryData = await res.json();
             renderTable();
             renderPartsSummary();
+            renderShipmentPicker();
         } catch (error) {
             console.error('Error fetching inventory:', error);
             tableBody.innerHTML = `<tr><td colspan="6" class="px-6 py-4 text-center text-sm text-red-500">Failed to load inventory.</td></tr>`;
@@ -195,11 +217,16 @@ document.addEventListener('DOMContentLoaded', () => {
         if (String(item.model || '').toLowerCase().includes(raw)) return true;
         if (normalizeSearchValue(item.serial_number).includes(compact)) return true;
         if (normalizeSearchValue(item.imei).includes(compact)) return true;
+        if (normalizeSearchValue(item.inventory_number).includes(compact)) return true;
+        if (normalizeSearchValue(item.tracking_number).includes(compact)) return true;
         return false;
     }
 
     function filteredInventory() {
-        return inventoryData.filter((item) => matchesSearch(item, searchInput.value));
+        return inventoryData.filter((item) => {
+            if (!showArchived.checked && locationStatus(item) === 'archived') return false;
+            return matchesSearch(item, searchInput.value);
+        });
     }
 
     function renderTable() {
@@ -221,34 +248,56 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         if (items.length === 0) {
-            tableBody.innerHTML = `<tr><td colspan="6" class="px-6 py-4 text-center text-sm text-gray-500">No devices match "${escapeHtml(query)}".</td></tr>`;
+            const archivedHidden = !showArchived.checked
+                && inventoryData.some((item) => locationStatus(item) === 'archived');
+            const message = query
+                ? `No devices match "${escapeHtml(query)}".`
+                : (archivedHidden
+                    ? 'No devices in storage or transit. Check Show archived to see sent devices.'
+                    : 'No devices in inventory yet.');
+            tableBody.innerHTML = `<tr><td colspan="6" class="px-6 py-4 text-center text-sm text-gray-500">${message}</td></tr>`;
             return;
         }
 
         tableBody.innerHTML = items.map((item) => {
+            const loc = locationStatus(item);
+            const archived = loc === 'archived';
+            const inTransit = loc === 'in_transit';
             const blocked = isBlockedLock(item.lock_status, item);
             const parts = parseParts(item.parts_needed);
             const state = REPAIR_STATES[repairState(item)];
             const partsStr = blocked
                 ? 'Excluded'
                 : (parts.length > 0 ? parts.join(', ') : 'None');
-            const rowClass = blocked
-                ? 'table-row-hover bg-red-50'
-                : 'table-row-hover';
+            const rowClass = archived
+                ? 'table-row-hover bg-gray-100 hover:bg-gray-200'
+                : (inTransit
+                    ? 'table-row-hover bg-sky-50 hover:bg-sky-100'
+                    : (blocked ? 'table-row-hover bg-red-50 hover:bg-red-100' : 'table-row-hover hover:bg-gray-50'));
+            const muted = archived;
+            const idClass = muted ? 'text-gray-500' : (blocked ? 'text-red-700' : 'text-gray-500');
+            const modelClass = muted ? 'text-gray-600' : (blocked ? 'text-red-900' : 'text-gray-900');
+            const subClass = muted ? 'text-gray-400' : (blocked ? 'text-red-700' : 'text-gray-500');
             const lockClass = blocked
                 ? 'bg-red-100 text-red-800'
                 : 'bg-green-100 text-green-800';
+            const trackingLine = inTransit && item.tracking_number
+                ? `<div class="text-xs text-sky-700 mt-1">Tracking ${escapeHtml(item.tracking_number)}</div>`
+                : (archived && item.tracking_number
+                    ? `<div class="text-xs text-gray-400 mt-1">Shipped ${escapeHtml(item.tracking_number)}</div>`
+                    : '');
 
             return `
                 <tr class="${rowClass}" data-id="${item.id}">
-                    <td class="px-3 py-4 whitespace-nowrap text-sm ${blocked ? 'text-red-700' : 'text-gray-500'}">
-                        #${item.id}<br><span class="text-xs ${blocked ? 'text-red-400' : 'text-gray-400'}">${item.date_received || ''}</span>
+                    <td class="px-3 py-4 whitespace-nowrap text-sm ${idClass}">
+                        #${item.id}<br><span class="text-xs ${muted ? 'text-gray-400' : (blocked ? 'text-red-400' : 'text-gray-400')}">${item.date_received || ''}</span>
                     </td>
                     <td class="px-3 py-4">
-                        <div class="text-sm font-medium ${blocked ? 'text-red-900' : 'text-gray-900'}">${escapeHtml(item.model || 'Unknown')}</div>
-                        <div class="text-xs ${blocked ? 'text-red-700' : 'text-gray-500'}">${item.inventory_number ? '#' + escapeHtml(item.inventory_number) + ' · ' : ''}${escapeHtml(item.color || '')} ${escapeHtml(item.capacity || '')} ${item.vision_device_type ? '· ' + escapeHtml(item.vision_device_type) : ''}</div>
+                        <div class="text-sm font-medium ${modelClass}">${escapeHtml(item.model || 'Unknown')}</div>
+                        <div class="text-xs ${subClass}">${item.inventory_number ? '#' + escapeHtml(item.inventory_number) + ' · ' : ''}${escapeHtml(item.color || '')} ${escapeHtml(item.capacity || '')} ${item.vision_device_type ? '· ' + escapeHtml(item.vision_device_type) : ''}</div>
+                        ${trackingLine}
                     </td>
-                    <td class="px-3 py-4 whitespace-nowrap text-xs ${blocked ? 'text-red-700' : 'text-gray-500'}">
+                    <td class="px-3 py-4 whitespace-nowrap text-xs ${subClass}">
                         ${escapeHtml(item.serial_number || 'N/A')}<br>
                         ${escapeHtml(item.imei || 'N/A')}
                     </td>
@@ -291,6 +340,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         inventoryData.forEach((item) => {
             if (isBlockedLock(item.lock_status, item)) return;
+            if (isShippedOut(item)) return;
             const covered = coveredParts(item.id);
 
             parseParts(item.parts_needed).forEach((raw) => {
@@ -674,6 +724,7 @@ document.addEventListener('DOMContentLoaded', () => {
             elements.title.innerText = result.item.model || `Device #${currentItemId}`;
             renderTable();
             renderPartsSummary();
+            renderShipmentPicker();
             elements.btnSave.textContent = 'Saved';
             setTimeout(() => {
                 elements.btnSave.disabled = false;
@@ -705,6 +756,7 @@ document.addEventListener('DOMContentLoaded', () => {
             inventoryData = inventoryData.filter((i) => i.id !== currentItemId);
             renderTable();
             renderPartsSummary();
+            renderShipmentPicker();
             closeModal();
         } catch (error) {
             console.error('Delete error:', error);
@@ -714,6 +766,274 @@ document.addEventListener('DOMContentLoaded', () => {
             elements.btnDelete.textContent = 'Delete Device';
         }
     }
+
+    // ---- Shipments tab ----
+
+    const shipmentPicker = document.getElementById('shipment-picker');
+    const shipmentSearch = document.getElementById('shipment-search');
+    const shipmentTracking = document.getElementById('shipment-tracking');
+    const btnCreateShipment = document.getElementById('btn-create-shipment');
+    const shipmentSelectedCount = document.getElementById('shipment-selected-count');
+    const shipmentStatus = document.getElementById('shipment-status');
+    const shipmentsList = document.getElementById('shipments-list');
+    const printShipmentRoot = document.getElementById('print-shipment');
+
+    let shipmentsData = [];
+    const shipmentSelectedIds = new Set();
+
+    function formatTimestamp(value) {
+        if (!value) return '';
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return String(value);
+        return date.toLocaleString();
+    }
+
+    function showShipmentStatus(message, isError = false) {
+        shipmentStatus.classList.remove('hidden');
+        shipmentStatus.textContent = message;
+        shipmentStatus.classList.toggle('text-red-600', isError);
+        shipmentStatus.classList.toggle('text-gray-500', !isError);
+    }
+
+    function updateCreateShipmentButton() {
+        const hasTracking = Boolean(shipmentTracking.value.trim());
+        btnCreateShipment.disabled = !(hasTracking && shipmentSelectedIds.size > 0);
+        const n = shipmentSelectedIds.size;
+        shipmentSelectedCount.textContent = `${n} selected`;
+    }
+
+    function renderShipmentPicker() {
+        const query = shipmentSearch.value;
+        const inStorage = inventoryData.filter(isInStorage);
+        const items = inStorage.filter((item) => matchesSearch(item, query));
+
+        if (inStorage.length === 0) {
+            shipmentPicker.innerHTML = `<div class="px-4 py-6 text-center text-sm text-gray-500">No devices in storage to ship.</div>`;
+            updateCreateShipmentButton();
+            return;
+        }
+
+        if (items.length === 0) {
+            shipmentPicker.innerHTML = `<div class="px-4 py-6 text-center text-sm text-gray-500">No in-storage devices match "${escapeHtml(query.trim())}".</div>`;
+            updateCreateShipmentButton();
+            return;
+        }
+
+        shipmentPicker.innerHTML = items.map((item) => {
+            const checked = shipmentSelectedIds.has(item.id) ? 'checked' : '';
+            return `
+                <label class="flex items-start gap-3 px-4 py-3 hover:bg-gray-50 cursor-pointer">
+                    <input type="checkbox" class="shipment-pick mt-1 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                        data-id="${item.id}" ${checked}>
+                    <span class="min-w-0">
+                        <span class="block text-sm font-medium text-gray-900">#${item.id} · ${escapeHtml(item.model || 'Unknown')}</span>
+                        <span class="block text-xs text-gray-500">
+                            ${item.inventory_number ? 'Inv #' + escapeHtml(item.inventory_number) + ' · ' : ''}
+                            ${escapeHtml(item.serial_number || 'No serial')} · ${escapeHtml(item.imei || 'No IMEI')}
+                        </span>
+                    </span>
+                </label>
+            `;
+        }).join('');
+        updateCreateShipmentButton();
+    }
+
+    async function loadShipments() {
+        try {
+            const res = await fetch('/api/shipments');
+            shipmentsData = await res.json();
+            renderShipments();
+        } catch (error) {
+            console.error('Error fetching shipments:', error);
+            shipmentsList.innerHTML = `<div class="bg-white shadow rounded-lg p-6 text-center text-sm text-red-500">Failed to load shipments.</div>`;
+        }
+    }
+
+    function renderShipments() {
+        if (!shipmentsData.length) {
+            shipmentsList.innerHTML = `<div class="bg-white shadow rounded-lg p-6 text-center text-sm text-gray-500">No shipments yet.</div>`;
+            return;
+        }
+
+        shipmentsList.innerHTML = shipmentsData.map((shipment) => {
+            const inTransit = shipment.status === 'in_transit';
+            const statusClass = inTransit
+                ? 'bg-sky-100 text-sky-800'
+                : 'bg-gray-200 text-gray-700';
+            const statusLabel = inTransit ? 'In Transit' : 'Received';
+            const dateLabel = inTransit
+                ? `Created ${escapeHtml(formatTimestamp(shipment.created_at))}`
+                : `Received ${escapeHtml(formatTimestamp(shipment.received_at || shipment.created_at))}`;
+            const actions = inTransit
+                ? `
+                    <button type="button" class="btn-print-shipment border border-gray-300 hover:bg-gray-50 text-gray-700 text-sm font-medium px-3 py-1.5 rounded-lg" data-id="${shipment.id}">Print list</button>
+                    <button type="button" class="btn-receive-shipment bg-green-600 hover:bg-green-700 text-white text-sm font-medium px-3 py-1.5 rounded-lg" data-id="${shipment.id}">Confirm received</button>
+                    <button type="button" class="btn-cancel-shipment border border-red-200 hover:bg-red-50 text-red-700 text-sm font-medium px-3 py-1.5 rounded-lg" data-id="${shipment.id}">Cancel shipment</button>
+                `
+                : `
+                    <button type="button" class="btn-print-shipment border border-gray-300 hover:bg-gray-50 text-gray-700 text-sm font-medium px-3 py-1.5 rounded-lg" data-id="${shipment.id}">Print list</button>
+                `;
+
+            const rows = (shipment.items || []).map((item) => `
+                <tr class="border-t border-gray-100">
+                    <td class="px-3 py-2 text-sm text-gray-500">#${item.id}</td>
+                    <td class="px-3 py-2 text-sm text-gray-900">${escapeHtml(item.model || 'Unknown')}</td>
+                    <td class="px-3 py-2 text-xs text-gray-500">${escapeHtml(item.serial_number || 'N/A')}<br>${escapeHtml(item.imei || 'N/A')}</td>
+                    <td class="px-3 py-2 text-right">
+                        ${inTransit
+                            ? `<button type="button" class="btn-remove-shipment-item text-xs text-red-600 hover:text-red-800" data-id="${shipment.id}" data-item="${item.id}">Remove</button>`
+                            : ''}
+                    </td>
+                </tr>
+            `).join('');
+
+            return `
+                <div class="bg-white shadow rounded-lg overflow-hidden" data-shipment="${shipment.id}">
+                    <div class="px-4 py-3 bg-gray-50 border-b border-gray-200 flex flex-wrap items-center gap-3">
+                        <span class="text-sm font-semibold text-gray-800">${escapeHtml(shipment.tracking_number)}</span>
+                        <span class="px-2 py-0.5 rounded-full text-xs font-semibold ${statusClass}">${statusLabel}</span>
+                        <span class="text-xs text-gray-500">${shipment.item_count || (shipment.items || []).length} item${(shipment.item_count || (shipment.items || []).length) === 1 ? '' : 's'}</span>
+                        <span class="text-xs text-gray-400">${dateLabel}</span>
+                        <div class="ml-auto flex flex-wrap gap-2">${actions}</div>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="min-w-full">
+                            <thead>
+                                <tr class="text-left text-xs font-medium text-gray-500 uppercase">
+                                    <th class="px-3 py-2">ID</th>
+                                    <th class="px-3 py-2">Model</th>
+                                    <th class="px-3 py-2">Serial / IMEI</th>
+                                    <th class="px-3 py-2"></th>
+                                </tr>
+                            </thead>
+                            <tbody>${rows || `<tr><td colspan="4" class="px-3 py-4 text-sm text-gray-500">No devices.</td></tr>`}</tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+        }).join('');
+    }
+
+    async function refreshAfterShipmentChange() {
+        await Promise.all([loadInventory(), loadShipments()]);
+    }
+
+    async function createShipment() {
+        const tracking_number = shipmentTracking.value.trim();
+        const inventory_ids = Array.from(shipmentSelectedIds);
+        if (!tracking_number || inventory_ids.length === 0) return;
+
+        btnCreateShipment.disabled = true;
+        btnCreateShipment.textContent = 'Creating...';
+        try {
+            const res = await fetch('/api/shipments', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ tracking_number, inventory_ids }),
+            });
+            const result = await res.json();
+            if (!res.ok) throw new Error(result.message || 'Create failed');
+            shipmentSelectedIds.clear();
+            shipmentTracking.value = '';
+            shipmentSearch.value = '';
+            showShipmentStatus(`Created shipment ${result.shipment.tracking_number} with ${result.shipment.item_count} item${result.shipment.item_count === 1 ? '' : 's'}.`);
+            await refreshAfterShipmentChange();
+        } catch (error) {
+            showShipmentStatus(error.message || 'Failed to create shipment', true);
+        } finally {
+            btnCreateShipment.textContent = 'Create shipment';
+            updateCreateShipmentButton();
+        }
+    }
+
+    async function cancelShipment(shipmentId) {
+        const shipment = shipmentsData.find((s) => s.id === shipmentId);
+        const label = shipment ? shipment.tracking_number : `#${shipmentId}`;
+        if (!confirm(`Cancel shipment ${label}? Devices will return to In Storage.`)) return;
+        try {
+            const res = await fetch(`/api/shipments/${shipmentId}`, { method: 'DELETE' });
+            const result = await res.json();
+            if (!res.ok) throw new Error(result.message || 'Cancel failed');
+            showShipmentStatus(`Cancelled ${label}.`);
+            await refreshAfterShipmentChange();
+        } catch (error) {
+            showShipmentStatus(error.message || 'Failed to cancel shipment', true);
+        }
+    }
+
+    async function receiveShipment(shipmentId) {
+        const shipment = shipmentsData.find((s) => s.id === shipmentId);
+        const label = shipment ? shipment.tracking_number : `#${shipmentId}`;
+        if (!confirm(`Confirm ${label} received? Devices will be archived.`)) return;
+        try {
+            const res = await fetch(`/api/shipments/${shipmentId}/receive`, { method: 'POST' });
+            const result = await res.json();
+            if (!res.ok) throw new Error(result.message || 'Update failed');
+            showShipmentStatus(`Marked ${label} received.`);
+            await refreshAfterShipmentChange();
+        } catch (error) {
+            showShipmentStatus(error.message || 'Failed to confirm received', true);
+        }
+    }
+
+    async function removeShipmentItem(shipmentId, inventoryId) {
+        try {
+            const res = await fetch(`/api/shipments/${shipmentId}/items/${inventoryId}`, { method: 'DELETE' });
+            const result = await res.json();
+            if (!res.ok) throw new Error(result.message || 'Remove failed');
+            showShipmentStatus(result.deleted ? 'Shipment removed (no items left).' : `Removed device #${inventoryId}.`);
+            await refreshAfterShipmentChange();
+        } catch (error) {
+            showShipmentStatus(error.message || 'Failed to remove device', true);
+        }
+    }
+
+    function printShipment(shipment) {
+        const items = shipment.items || [];
+        const rows = items.map((item) => `
+            <tr>
+                <td>${item.id}</td>
+                <td>${escapeHtml(item.inventory_number || '')}</td>
+                <td>${escapeHtml(item.model || '')}</td>
+                <td>${escapeHtml(item.color || '')}</td>
+                <td>${escapeHtml(item.capacity || '')}</td>
+                <td>${escapeHtml(item.serial_number || '')}</td>
+                <td>${escapeHtml(item.imei || '')}</td>
+                <td>${escapeHtml(item.lock_status || '')}</td>
+                <td>${escapeHtml(item.damage_condition || '')}</td>
+            </tr>
+        `).join('');
+
+        printShipmentRoot.innerHTML = `
+            <h1 style="font-size: 22px; font-weight: 700; margin: 0 0 8px;">Shipment inventory list</h1>
+            <p style="margin: 0 0 4px;"><strong>Tracking:</strong> ${escapeHtml(shipment.tracking_number || '')}</p>
+            <p style="margin: 0 0 4px;"><strong>Date:</strong> ${escapeHtml(formatTimestamp(shipment.created_at))}</p>
+            <p style="margin: 0 0 16px;"><strong>Items:</strong> ${items.length}</p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Inv #</th>
+                        <th>Model</th>
+                        <th>Color</th>
+                        <th>Capacity</th>
+                        <th>Serial</th>
+                        <th>IMEI</th>
+                        <th>Lock</th>
+                        <th>Condition</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${rows || '<tr><td colspan="9">No devices.</td></tr>'}
+                </tbody>
+            </table>
+        `;
+        window.print();
+    }
+
+    window.addEventListener('afterprint', () => {
+        printShipmentRoot.innerHTML = '';
+    });
 
     // ---- Purchases tab ----
 
@@ -1067,10 +1387,40 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     tabInventory.addEventListener('click', () => setActiveTab('inventory'));
+    tabShipments.addEventListener('click', () => setActiveTab('shipments'));
     tabParts.addEventListener('click', () => setActiveTab('parts'));
     tabPurchases.addEventListener('click', () => setActiveTab('purchases'));
     searchInput.addEventListener('input', renderTable);
     sortSelect.addEventListener('change', renderTable);
+    showArchived.addEventListener('change', renderTable);
+    shipmentSearch.addEventListener('input', renderShipmentPicker);
+    shipmentTracking.addEventListener('input', updateCreateShipmentButton);
+    btnCreateShipment.addEventListener('click', createShipment);
+    shipmentPicker.addEventListener('change', (e) => {
+        const box = e.target.closest('.shipment-pick');
+        if (!box) return;
+        const id = parseInt(box.dataset.id, 10);
+        if (Number.isNaN(id)) return;
+        if (box.checked) shipmentSelectedIds.add(id);
+        else shipmentSelectedIds.delete(id);
+        updateCreateShipmentButton();
+    });
+    shipmentsList.addEventListener('click', (e) => {
+        const printBtn = e.target.closest('.btn-print-shipment');
+        const receiveBtn = e.target.closest('.btn-receive-shipment');
+        const cancelBtn = e.target.closest('.btn-cancel-shipment');
+        const removeBtn = e.target.closest('.btn-remove-shipment-item');
+        if (printBtn) {
+            const shipment = shipmentsData.find((s) => s.id === parseInt(printBtn.dataset.id, 10));
+            if (shipment) printShipment(shipment);
+        } else if (receiveBtn) {
+            receiveShipment(parseInt(receiveBtn.dataset.id, 10));
+        } else if (cancelBtn) {
+            cancelShipment(parseInt(cancelBtn.dataset.id, 10));
+        } else if (removeBtn) {
+            removeShipmentItem(parseInt(removeBtn.dataset.id, 10), parseInt(removeBtn.dataset.item, 10));
+        }
+    });
     partsHideOrdered.addEventListener('change', renderPartsSummary);
     document.getElementById('btn-copy-parts').addEventListener('click', (e) => {
         copyShoppingList(null, e.currentTarget);

@@ -36,7 +36,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 init_db()
 
 def get_db_connection():
-    conn = sqlite3.connect('inventory.db')
+    conn = sqlite3.connect('inventory.db', timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA foreign_keys = ON')
     return conn
@@ -199,10 +199,58 @@ def scanner():
 def serve_uploads(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
 
+INVENTORY_WITH_LOCATION_SQL = '''
+    SELECT i.*,
+           CASE
+               WHEN s.status = 'received' THEN 'archived'
+               WHEN s.status = 'in_transit' THEN 'in_transit'
+               ELSE 'in_storage'
+           END AS location_status,
+           s.tracking_number,
+           s.id AS shipment_id
+    FROM inventory i
+    LEFT JOIN shipment_items si ON si.inventory_id = i.id
+    LEFT JOIN shipments s ON s.id = si.shipment_id
+'''
+
+
+def get_inventory_item(conn, item_id):
+    row = conn.execute(INVENTORY_WITH_LOCATION_SQL + ' WHERE i.id = ?', (item_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def _shipment_items(conn, shipment_id):
+    rows = conn.execute('''
+        SELECT i.id, i.model, i.serial_number, i.imei, i.inventory_number,
+               i.color, i.capacity, i.lock_status, i.damage_condition
+        FROM shipment_items si
+        JOIN inventory i ON i.id = si.inventory_id
+        WHERE si.shipment_id = ?
+        ORDER BY i.id
+    ''', (shipment_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _shipment_payload(conn, shipment):
+    data = dict(shipment)
+    data['items'] = _shipment_items(conn, data['id'])
+    data['item_count'] = len(data['items'])
+    return data
+
+
+def _delete_empty_shipments(conn):
+    conn.execute('''
+        DELETE FROM shipments
+        WHERE NOT EXISTS (
+            SELECT 1 FROM shipment_items WHERE shipment_items.shipment_id = shipments.id
+        )
+    ''')
+
+
 @app.route('/api/inventory', methods=['GET'])
 def get_inventory():
     conn = get_db_connection()
-    inventory = conn.execute('SELECT * FROM inventory ORDER BY id DESC').fetchall()
+    inventory = conn.execute(INVENTORY_WITH_LOCATION_SQL + ' ORDER BY i.id DESC').fetchall()
     conn.close()
     return jsonify([dict(ix) for ix in inventory])
 
@@ -365,9 +413,9 @@ def update_inventory(item_id):
     values.append(item_id)
     conn.execute(f"UPDATE inventory SET {', '.join(fields)} WHERE id = ?", values)
     conn.commit()
-    updated = conn.execute('SELECT * FROM inventory WHERE id = ?', (item_id,)).fetchone()
+    updated = get_inventory_item(conn, item_id)
     conn.close()
-    return jsonify({'success': True, 'item': dict(updated)})
+    return jsonify({'success': True, 'item': updated})
 
 
 def _delete_upload_file(image_url):
@@ -394,6 +442,7 @@ def delete_inventory(item_id):
 
     item = dict(row)
     conn.execute('DELETE FROM inventory WHERE id = ?', (item_id,))
+    _delete_empty_shipments(conn)
     conn.commit()
     conn.close()
 
@@ -638,6 +687,167 @@ def all_incoming_parts():
     incoming = incoming_parts_by_device(conn)
     conn.close()
     return jsonify({str(device_id): parts for device_id, parts in incoming.items()})
+
+
+# ---- Shipments ----
+
+@app.route('/api/shipments', methods=['GET'])
+def list_shipments():
+    conn = get_db_connection()
+    rows = conn.execute('''
+        SELECT * FROM shipments
+        ORDER BY CASE status WHEN 'in_transit' THEN 0 ELSE 1 END, id DESC
+    ''').fetchall()
+    shipments = [_shipment_payload(conn, row) for row in rows]
+    conn.close()
+    return jsonify(shipments)
+
+
+@app.route('/api/shipments', methods=['POST'])
+def create_shipment():
+    data = request.json or {}
+    tracking_number = str(data.get('tracking_number') or '').strip()
+    raw_ids = data.get('inventory_ids') or []
+    if not tracking_number:
+        return jsonify({'success': False, 'message': 'Tracking number is required'}), 400
+    if not isinstance(raw_ids, list) or not raw_ids:
+        return jsonify({'success': False, 'message': 'Select at least one device'}), 400
+
+    try:
+        inventory_ids = sorted({int(item_id) for item_id in raw_ids})
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'message': 'inventory_ids must be integers'}), 400
+
+    conn = get_db_connection()
+    placeholders = ','.join('?' * len(inventory_ids))
+    found = {
+        row['id']
+        for row in conn.execute(
+            f'SELECT id FROM inventory WHERE id IN ({placeholders})',
+            inventory_ids,
+        ).fetchall()
+    }
+    missing = [item_id for item_id in inventory_ids if item_id not in found]
+    if missing:
+        conn.close()
+        return jsonify({
+            'success': False,
+            'message': f'Device(s) not found: {", ".join("#" + str(i) for i in missing)}',
+        }), 400
+
+    already = conn.execute(
+        f'''
+        SELECT si.inventory_id, s.tracking_number, s.status
+        FROM shipment_items si
+        JOIN shipments s ON s.id = si.shipment_id
+        WHERE si.inventory_id IN ({placeholders})
+        ''',
+        inventory_ids,
+    ).fetchall()
+    if already:
+        conn.close()
+        labels = [
+            f"#{row['inventory_id']} ({row['tracking_number']})"
+            for row in already
+        ]
+        return jsonify({
+            'success': False,
+            'message': 'Already on a shipment: ' + ', '.join(labels),
+        }), 409
+
+    created_at = datetime.now(timezone.utc).isoformat()
+    cursor = conn.cursor()
+    cursor.execute(
+        'INSERT INTO shipments (tracking_number, status, created_at) VALUES (?, ?, ?)',
+        (tracking_number, 'in_transit', created_at),
+    )
+    shipment_id = cursor.lastrowid
+    cursor.executemany(
+        'INSERT INTO shipment_items (shipment_id, inventory_id) VALUES (?, ?)',
+        [(shipment_id, item_id) for item_id in inventory_ids],
+    )
+    conn.commit()
+    shipment = _shipment_payload(
+        conn,
+        conn.execute('SELECT * FROM shipments WHERE id = ?', (shipment_id,)).fetchone(),
+    )
+    conn.close()
+    return jsonify({'success': True, 'shipment': shipment}), 201
+
+
+@app.route('/api/shipments/<int:shipment_id>', methods=['DELETE'])
+def cancel_shipment(shipment_id):
+    conn = get_db_connection()
+    shipment = conn.execute('SELECT * FROM shipments WHERE id = ?', (shipment_id,)).fetchone()
+    if not shipment:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Shipment not found'}), 404
+    if shipment['status'] == 'received':
+        conn.close()
+        return jsonify({'success': False, 'message': 'Cannot cancel a received shipment'}), 409
+
+    conn.execute('DELETE FROM shipments WHERE id = ?', (shipment_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
+
+
+@app.route('/api/shipments/<int:shipment_id>/items/<int:inventory_id>', methods=['DELETE'])
+def remove_shipment_item(shipment_id, inventory_id):
+    conn = get_db_connection()
+    shipment = conn.execute('SELECT * FROM shipments WHERE id = ?', (shipment_id,)).fetchone()
+    if not shipment:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Shipment not found'}), 404
+    if shipment['status'] == 'received':
+        conn.close()
+        return jsonify({'success': False, 'message': 'Cannot edit a received shipment'}), 409
+
+    row = conn.execute(
+        'SELECT id FROM shipment_items WHERE shipment_id = ? AND inventory_id = ?',
+        (shipment_id, inventory_id),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Device is not on this shipment'}), 404
+
+    conn.execute(
+        'DELETE FROM shipment_items WHERE shipment_id = ? AND inventory_id = ?',
+        (shipment_id, inventory_id),
+    )
+    _delete_empty_shipments(conn)
+    conn.commit()
+    remaining = conn.execute('SELECT * FROM shipments WHERE id = ?', (shipment_id,)).fetchone()
+    payload = _shipment_payload(conn, remaining) if remaining else None
+    conn.close()
+    if payload:
+        return jsonify({'success': True, 'deleted': False, 'shipment': payload})
+    return jsonify({'success': True, 'deleted': True})
+
+
+@app.route('/api/shipments/<int:shipment_id>/receive', methods=['POST'])
+def receive_shipment(shipment_id):
+    conn = get_db_connection()
+    shipment = conn.execute('SELECT * FROM shipments WHERE id = ?', (shipment_id,)).fetchone()
+    if not shipment:
+        conn.close()
+        return jsonify({'success': False, 'message': 'Shipment not found'}), 404
+    if shipment['status'] == 'received':
+        conn.close()
+        return jsonify({'success': False, 'message': 'Shipment is already marked received'}), 409
+
+    received_at = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE shipments SET status = 'received', received_at = ? WHERE id = ?",
+        (received_at, shipment_id),
+    )
+    conn.commit()
+    updated = _shipment_payload(
+        conn,
+        conn.execute('SELECT * FROM shipments WHERE id = ?', (shipment_id,)).fetchone(),
+    )
+    conn.close()
+    return jsonify({'success': True, 'shipment': updated})
 
 
 # ---- LLM settings ----

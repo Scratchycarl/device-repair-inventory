@@ -1,7 +1,7 @@
 import sqlite3
 
 def init_db():
-    conn = sqlite3.connect('inventory.db')
+    conn = sqlite3.connect('inventory.db', timeout=30)
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -94,6 +94,25 @@ def init_db():
         cache_key TEXT PRIMARY KEY,
         result TEXT,
         created_at TEXT
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS shipments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tracking_number TEXT NOT NULL,
+        status TEXT DEFAULT 'in_transit',
+        created_at TEXT,
+        received_at TEXT
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS shipment_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        shipment_id INTEGER NOT NULL REFERENCES shipments(id) ON DELETE CASCADE,
+        inventory_id INTEGER NOT NULL REFERENCES inventory(id) ON DELETE CASCADE,
+        UNIQUE(inventory_id)
     )
     ''')
 
